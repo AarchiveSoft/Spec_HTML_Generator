@@ -10,10 +10,13 @@
 # - Title input drives the default export filename.
 # - Subtle brand theming using accent #006c8c.
 
-from PySide6.QtCore import Qt, QSize
+import sys
+import os
+
+from PySide6.QtCore import Qt, QSize, QTimer
 from PySide6.QtGui import (
     QAction, QKeySequence, QTextCharFormat, QTextCursor, QTextListFormat,
-    QTextTableFormat, QFont, QColor, QGuiApplication, QFontDatabase, QClipboard, QPalette
+    QTextTableFormat, QFont, QColor, QGuiApplication, QFontDatabase, QClipboard, QPalette, QIcon, QPixmap
 )
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QToolBar, QVBoxLayout, QHBoxLayout,
@@ -21,11 +24,11 @@ from PySide6.QtWidgets import (
     QColorDialog, QCheckBox, QFrame
 )
 
-APP_TITLE = "Specs Editor → Paste-ready HTML (No HTML Editing)"
+APP_TITLE = "Claudias Spezifikationen Assistent"
 
 DEFAULT_HEADER_LEFT = "Kategorie"
 DEFAULT_HEADER_RIGHT = "Details"
-DEFAULT_EXPORT_TITLE = "specs_block"  # used to prefill the Title field and default filename
+DEFAULT_EXPORT_TITLE = "Technische_Daten"  # used to prefill the Title field and default filename
 
 # Brand accent color (sparingly used)
 ACCENT = "#006c8c"
@@ -40,6 +43,10 @@ table.specs {width:100%; border-collapse:collapse; font-family:Arial, Helvetica,
       ul {margin:6px 0 6px 18px; padding:0;}</style>
 """.strip()
 
+def resource_path(relative_path):
+    """ Get absolute path to resource, works for dev and for PyInstaller .exe """
+    base_path = getattr(sys, '_MEIPASS', os.path.abspath("."))
+    return os.path.join(base_path, relative_path)
 
 def try_set_modern_app_font():
     """Prefer Aptos if installed; otherwise fall back to a clean system UI font (Qt 6-safe static API)."""
@@ -185,6 +192,21 @@ def apply_brand_theme(app: QApplication):
     }}
     """)
 
+def print_widget_sizes(window, widgets):
+    """
+    Print width/height of each widget after the UI has been shown.
+    :param window: the QMainWindow or QWidget
+    :param widgets: dict of {name: widget}
+    """
+    def _report():
+        print("=== Widget sizes ===")
+        for name, w in widgets.items():
+            if w is not None:
+                print(f"{name}: {w.width()} x {w.height()}")
+        print("====================")
+
+    # Defer until event loop has settled
+    QTimer.singleShot(0, _report)
 
 class RichTextArea(QTextEdit):
     """Rich text control (no raw HTML shown)."""
@@ -195,7 +217,7 @@ class RichTextArea(QTextEdit):
 
     def toggle_italic(self):
         fmt = QTextCharFormat()
-        fmt.setFontWeight(QFont.Bold if self.fontWeight() != QFont.Bold else QFont.Normal)
+        fmt.setFontItalic(not self.fontItalic())
         self.mergeCurrentCharFormat(fmt)
 
     def pick_color(self):
@@ -366,25 +388,25 @@ def _sanitize_filename(name: str) -> str:
     valid = "".join(ch if ch.isalnum() or ch in (" ", "-", "_") else "_" for ch in name).strip()
     return "_".join(valid.split()) or DEFAULT_EXPORT_TITLE
 
-
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_TITLE)
+        self.setWindowIcon(QIcon(resource_path("icon_gra.ico")))
         self.resize(980, 760)
         try_set_modern_app_font()
         apply_brand_theme(QApplication.instance())
 
         # Top toolbar (formatting targets the active widget: Value input or table)
-        tb = QToolBar("Formatting")
+        tb = QToolBar("Formatierung")
         tb.setIconSize(QSize(18, 18))
         self.addToolBar(tb)
 
-        act_bold = QAction("Fett", self)
+        act_bold = QAction("Fett (CTRL + B)", self)
         act_bold.setShortcut(QKeySequence.Bold)
         act_bold.triggered.connect(self.on_bold)
 
-        act_italic = QAction("Kursiv", self)
+        act_italic = QAction("Kursiv (CTRL + I)", self)
         act_italic.setShortcut(QKeySequence.Italic)
         act_italic.triggered.connect(self.on_italic)
 
@@ -418,14 +440,6 @@ class MainWindow(QMainWindow):
         title_row.addWidget(self.title_in)
         outer.addLayout(title_row)
 
-        # Section heading
-        specs_label = QLabel("Vorschau")
-        specs_label.setProperty("class", "section")
-        outer.addWidget(specs_label)
-
-        self.specs = SpecsTableEditor()
-        outer.addWidget(self.specs, 1)
-
         # Headers controls (disabled by default, gated by checkbox)
         hdr_row1 = QHBoxLayout()
         self.chk_headers = QCheckBox("Titel verändern?")
@@ -457,6 +471,7 @@ class MainWindow(QMainWindow):
         kv_row1 = QHBoxLayout()
         self.key_in = QLineEdit()
         self.key_in.setPlaceholderText("Schlüssel (Kategorie / Titel)")
+        self.key_in.setFixedWidth(759)
         paste_key = QPushButton("Schlüssel einfügen (Zwischenablage)")
         paste_key.clicked.connect(self.paste_key_from_clipboard)
         kv_row1.addWidget(self.key_in)
@@ -469,8 +484,9 @@ class MainWindow(QMainWindow):
         self.val_in.setPlaceholderText("Wert (Liste, Fett, Farbe). Enter = Neue Zeile")
         self.val_in.setAcceptRichText(True)
         self.val_in.setMinimumHeight(160)
+        self.val_in.setFixedWidth(759)
         right_buttons = QVBoxLayout()
-        paste_val = QPushButton("Wert Einfügen (Zwischenablage)")
+        paste_val = QPushButton("Wert einfügen (Zwischenablage)")
         add_btn = QPushButton("Eintrag hinzufügen")
         # Primary accents for the main actions
         add_btn.setObjectName("primaryButton")
@@ -494,12 +510,41 @@ class MainWindow(QMainWindow):
         delete = QPushButton("Eintrag löschen")
         up.clicked.connect(lambda: self.specs.move_selected_row(-1))
         down.clicked.connect(lambda: self.specs.move_selected_row(+1))
-        delete.clicked.connect(self.specs.delete_selected_row)
-        ops.addWidget(up); ops.addWidget(down); ops.addStretch(1); ops.addWidget(delete)
+        ops.addWidget(up); ops.addWidget(down); ops.addStretch(); ops.addWidget(delete)
         outer.addLayout(ops)
 
         self.statusBar().showMessage("Bereit")
+
+        # Section heading
+        specs_label = QLabel("Vorschau")
+        specs_label.setProperty("class", "section")
+        outer.addWidget(specs_label)
+
+        self.specs = SpecsTableEditor()
+        spec_layout = QHBoxLayout()
+
+        robot_label = QLabel(self)
+        robot_image = QPixmap('robot_gra_100px.png')
+        robot_label.setPixmap(robot_image)
+        robot_label.setAlignment(Qt.AlignmentFlag.AlignRight)
+        robot_label.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+
+        spec_layout.addWidget(self.specs)
+        spec_layout.addWidget(robot_label)
+
+        outer.addLayout(spec_layout)
+        delete.clicked.connect(self.specs.delete_selected_row)
+
         self.specs.ensure_table(DEFAULT_HEADER_LEFT, DEFAULT_HEADER_RIGHT)
+
+        print_widget_sizes(self, {
+            "Key Input": self.key_in,
+            "Value input": self.val_in,
+            "paste key": paste_key,
+            "paste val": paste_val,
+            "hinz button": add_btn,
+            "exportieren button": export_btn_sidecar
+        })
 
     # Formatting targeting whichever rich text widget has focus (Value editor or table)
     def current_text_widget(self):
@@ -510,6 +555,11 @@ class MainWindow(QMainWindow):
         w = self.current_text_widget()
         if hasattr(w, "toggle_bold"):
             w.toggle_bold()
+
+    def on_italic(self):
+        w = self.current_text_widget()
+        if hasattr(w, "toggle_italic"):
+            w.toggle_italic()
 
     def on_color(self):
         w = self.current_text_widget()
