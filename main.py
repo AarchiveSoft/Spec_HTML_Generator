@@ -2,6 +2,7 @@
 # Requirements: Python 3.9+  ->  pip install PySide6
 
 import sys, os
+import re
 from PySide6.QtCore import Qt, QSize, QTimer, Signal
 from PySide6.QtGui import (
     QAction, QKeySequence, QTextCharFormat, QTextCursor, QTextListFormat,
@@ -11,7 +12,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QToolBar, QVBoxLayout, QHBoxLayout,
     QLabel, QTextEdit, QLineEdit, QPushButton, QFileDialog, QMessageBox,
     QColorDialog, QCheckBox, QFrame, QSizePolicy, QScrollArea, QGridLayout,
-    QToolButton
+    QToolButton, QSpacerItem
 )
 
 APP_TITLE = "Claudias Spezifikationen Assistent"
@@ -53,8 +54,6 @@ def apply_brand_theme(app: QApplication):
     QLabel[class="section"] {{
         color: {ACCENT}; font-weight: 700; font-size: 20px; padding: 6px 0;
     }}
-
-    /* Accent separator lines */
     QFrame[frameShape="4"] {{
         color: {ACCENT};
         background: qlineargradient(x1:0,y1:0,x2:1,y2:0,
@@ -63,8 +62,6 @@ def apply_brand_theme(app: QApplication):
                                     stop:1 rgba(0,0,0,0));
         min-height: 1px; max-height: 1px; border: none; margin: 10px 0;
     }}
-
-    /* Formatting toolbar (vertical, accent buttons) */
     QToolBar#formatToolbar {{
         border: none; padding: 8px 10px; border-right: 1px solid rgba(0,0,0,0.08);
     }}
@@ -76,7 +73,6 @@ def apply_brand_theme(app: QApplication):
     QToolBar#formatToolbar QToolButton:hover  {{ background: rgba(0,108,140,0.92); }}
     QToolBar#formatToolbar QToolButton:pressed{{ background: rgba(0,108,140,0.84); }}
 
-    /* Table-like look */
     .KVTable QLineEdit, .KVTable QTextEdit {{
         border: 1px solid rgba(0,0,0,0.18);
         border-radius: 0; padding: 8px 10px; background: palette(base);
@@ -84,20 +80,13 @@ def apply_brand_theme(app: QApplication):
     .KVTable QLineEdit:focus, .KVTable QTextEdit:focus {{
         border: 2px solid {ACCENT}; outline: none;
     }}
-
-    /* Header cells styled like your <th> */
-    .HeaderCell {{
-        font-weight: 700;
-        background: #f5f5f5;
-    }}
-
-    /* Input row highlight */
+    .HeaderCell {{ font-weight: 700; background: #f5f5f5; }}
     .InputRow QLineEdit, .InputRow QTextEdit {{
         background: rgba(0,108,140,0.06);
         border: 1px solid rgba(0,108,140,0.30);
     }}
 
-    /* Primary buttons */
+    /* Primary (big) */
     QPushButton#primaryButton {{
         border: 1px solid {ACCENT}; background: rgba(0,108,140,0.10);
         color: palette(text); font-weight: 600; padding: 10px 16px; border-radius: 10px;
@@ -105,7 +94,19 @@ def apply_brand_theme(app: QApplication):
     QPushButton#primaryButton:hover  {{ background: rgba(0,108,140,0.18); }}
     QPushButton#primaryButton:pressed{{ background: rgba(0,108,140,0.24); }}
 
-    /* Small action buttons on rows */
+    /* Small accent buttons (for paste buttons) */
+    QPushButton#accentSmall {{
+        border: 1px solid {ACCENT};
+        background: {ACCENT};
+        color: #ffffff;
+        font-weight: 600;
+        padding: 6px 10px;   /* smaller than primary */
+        border-radius: 8px;
+        margin: 0;
+    }}
+    QPushButton#accentSmall:hover  {{ background: rgba(0,108,140,0.92); }}
+    QPushButton#accentSmall:pressed{{ background: rgba(0,108,140,0.84); }}
+
     QToolButton.rowAction {{
         border: 1px solid rgba(0,0,0,0.18);
         border-radius: 6px; padding: 6px 8px; background: palette(button);
@@ -119,6 +120,30 @@ def apply_brand_theme(app: QApplication):
     QScrollBar::handle:vertical:hover {{ background: rgba(0,0,0,0.28); }}
 
     QStatusBar {{ border-top: 1px solid rgba(0,0,0,0.08); }}
+    /* Panel around format toolbar */
+    QFrame#formatPanel {{
+        border: 1px solid #006c8c;
+        border-radius: 12px;
+        background: rgba(0,108,140,0.10);
+    }}
+    
+    /* Panel header pill */
+    QLabel#formatPanelTitle {{
+        color: #ffffff;
+        background: #006c8c;
+        font-weight: 700;
+        padding: 6px 10px;
+        border-radius: 8px;
+    }}
+    
+    /* Keep toolbar tidy inside the panel */
+    QFrame#formatPanel QToolBar#formatToolbar {{
+        border: none;
+        padding: 6px 4px;
+    }}
+    QFrame#formatPanel QToolBar#formatToolbar QToolButton {{
+        margin: 4px 0;
+    }}
     """)
 
 def make_separator() -> QFrame:
@@ -136,6 +161,18 @@ class RichTextArea(QTextEdit):
         if (e.key() in (Qt.Key_Return, Qt.Key_Enter)) and (e.modifiers() & Qt.ControlModifier):
             self.confirm.emit(); return
         super().keyPressEvent(e)
+
+    # --- force plain-text paste everywhere (Ctrl+V, context menu, drops, programmatic) ---
+    def insertFromMimeData(self, source):
+        text = source.text()
+        if text:
+            self.insertPlainText(text)
+        else:
+            super().insertFromMimeData(source)
+
+    def paste(self):
+        cb = QApplication.clipboard()
+        self.insertPlainText(cb.text() or "")
 
     def toggle_bold(self):
         fmt = QTextCharFormat()
@@ -176,7 +213,6 @@ class AutoGrowTextEdit(RichTextArea):
         self._update_height()
 
     def resizeEvent(self, e):
-        # ensure wrapping width updates
         self.document().setTextWidth(self.viewport().width())
         super().resizeEvent(e)
         self._update_height()
@@ -185,9 +221,7 @@ class AutoGrowTextEdit(RichTextArea):
         fm = self.fontMetrics()
         line = fm.lineSpacing()
         margin = self.document().documentMargin()
-        # natural doc height based on layout
         doc_h = self.document().size().height()
-        # baseline for min/max
         min_h = int(line * self._min_lines + margin * 2 + 6)
         max_h = int(line * self._max_lines + margin * 2 + 6)
         nat = int(doc_h + margin * 2 + 6)
@@ -199,6 +233,27 @@ class AutoGrowTextEdit(RichTextArea):
             self.setFixedHeight(h)
             self.heightChanged.emit(h)
 
+class PlainPasteLineEdit(QLineEdit):
+    """QLineEdit that always pastes plain text, collapsing whitespace."""
+    def insertFromMimeData(self, source):
+        text = source.text()  # ignore rich content
+        t = (text or "").replace("\r\n", "\n").replace("\r", "\n").replace("\u00A0", " ")
+        t = re.sub(r"\s+", " ", t).strip()  # single line
+        self.insert(t)
+
+class PlainPasteTextEdit(AutoGrowTextEdit):
+    """TextEdit that keeps rich editing (bold, bullets) but pastes as plain text.
+       Trims only leading/trailing *newlines* so multi-line stays intact."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setAcceptRichText(True)  # you still can format after pasting
+
+    def insertFromMimeData(self, source):
+        text = source.text()  # ignore rich content/HTML
+        t = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+        t = t.strip("\n")  # keep inner newlines
+        self.insertPlainText(t)
+
 # ---------- Entry row with actions ----------
 class EntryRow(QWidget):
     requestDelete = Signal(object)
@@ -207,25 +262,34 @@ class EntryRow(QWidget):
 
     def __init__(self, key_text: str, value_html: str, icons: dict[str, QIcon], parent=None):
         super().__init__(parent)
-        self.setProperty("class", "KVTable")  # for cell styles
+        self.setProperty("class", "KVTable")
 
         self.row_layout = QHBoxLayout(self)
         self.row_layout.setContentsMargins(0,0,0,0)
         self.row_layout.setSpacing(0)
 
         self.key = QLineEdit(key_text)
+        # Keep keys bold in the table rows as well
+        kf = self.key.font()
+        kf.setBold(True)
+        self.key.setFont(kf)
         self.key.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
 
         self.val = AutoGrowTextEdit(min_lines=3, max_lines=12)
         self.val.setAcceptRichText(True)
-        if value_html:
-            self.val.setHtml(f"<div>{value_html}</div>")
 
-        # Keep key cell height tracking the value height
+        if value_html:
+            # If we were given full HTML (with <html>), keep it intact.
+            s = value_html.strip().lower()
+            if s.startswith("<html"):
+                self.val.setHtml(value_html)
+            else:
+                # Inner-fragment case: wrap lightly so Qt parses it as rich text
+                self.val.setHtml(f"<div>{value_html}</div>")
+
         self.val.heightChanged.connect(self._sync_key_height)
         self._sync_key_height(self.val.height())
 
-        # Actions on the right
         actions = QWidget()
         a_lay = QHBoxLayout(actions)
         a_lay.setContentsMargins(6, 0, 0, 0)
@@ -253,9 +317,8 @@ class EntryRow(QWidget):
         a_lay.addWidget(self.btn_down)
         a_lay.addWidget(self.btn_del)
 
-        # Assemble row (key | value | actions)
         self.row_layout.addWidget(self.key, 1)
-        self.row_layout.addSpacing(1)   # thin grid line
+        self.row_layout.addSpacing(1)
         self.row_layout.addWidget(self.val, 2)
         self.row_layout.addSpacing(1)
         self.row_layout.addWidget(actions, 0)
@@ -294,107 +357,243 @@ class MainWindow(QMainWindow):
             "italic": QIcon(resource_path("icons/italic.svg")),
             "color" : QIcon(resource_path("icons/color.svg")),
             "list"  : QIcon(resource_path("icons/list.svg")),
-            "up"    : QIcon(resource_path("icons/arrow-up.svg")),
-            "down"  : QIcon(resource_path("icons/arrow-down.svg")),
-            "delete": QIcon(resource_path("icons/trash.svg")),
+            "up"    : QIcon(resource_path("icons/up_arrow.svg")),
+            "down"  : QIcon(resource_path("icons/down_arrow.svg")),
+            "delete": QIcon(resource_path("icons/bin.svg")),
         }
 
-        # --- Vertical formatting toolbar (left) ---
-        tb = QToolBar("Formatierung")
-        tb.setObjectName("formatToolbar")
-        tb.setOrientation(Qt.Vertical)
-        tb.setIconSize(QSize(18, 18))
-        tb.setMovable(False); tb.setFloatable(False)
-        tb.setToolButtonStyle(Qt.ToolButtonIconOnly)
-        tb.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
-
-        act_bold   = QAction(self.icons["bold"],  "", self);  act_bold.setToolTip("Fett (Ctrl+B)")
-        act_italic = QAction(self.icons["italic"],"", self);  act_italic.setToolTip("Kursiv (Ctrl+I)")
-        act_color  = QAction(self.icons["color"], "", self);  act_color.setToolTip("Textfarbe wählen")
-        act_list   = QAction(self.icons["list"],  "", self);  act_list.setToolTip("Liste (Ctrl+Shift+8)")
-        act_bold.setShortcut(QKeySequence.Bold); act_bold.triggered.connect(self.on_bold)
-        act_italic.setShortcut(QKeySequence.Italic); act_italic.triggered.connect(self.on_italic)
-        act_list.setShortcut("Ctrl+Shift+8"); act_list.triggered.connect(self.on_bullets)
+        # --- Actions (format) ---
+        act_bold = QAction(self.icons["bold"], "", self);
+        act_bold.setToolTip("Fett (Ctrl+B)")
+        act_italic = QAction(self.icons["italic"], "", self);
+        act_italic.setToolTip("Kursiv (Ctrl+I)")
+        act_color = QAction(self.icons["color"], "", self);
+        act_color.setToolTip("Textfarbe wählen")
+        act_list = QAction(self.icons["list"], "", self);
+        act_list.setToolTip("Liste (Ctrl+Shift+8)")
+        act_bold.setShortcut(QKeySequence.Bold);
+        act_bold.triggered.connect(self.on_bold)
+        act_italic.setShortcut(QKeySequence.Italic);
+        act_italic.triggered.connect(self.on_italic)
+        act_list.setShortcut("Ctrl+Shift+8");
+        act_list.triggered.connect(self.on_bullets)
         act_color.triggered.connect(self.on_color)
 
-        def _vstretch():
-            w = QWidget(); w.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Expanding); w.setMinimumWidth(1); return w
-        for act in (act_bold, act_italic, act_color, act_list):
-            tb.addWidget(_vstretch()); tb.addAction(act)
-        tb.addWidget(_vstretch())
+        # Helper: one-action toolbar so our existing CSS (QToolBar#formatToolbar QToolButton) still applies
+        def make_toolbar_for(act: QAction) -> QToolBar:
+            tb = QToolBar()
+            tb.setObjectName("formatToolbar")
+            tb.setOrientation(Qt.Horizontal)
+            tb.setIconSize(QSize(18, 18))
+            tb.setMovable(False);
+            tb.setFloatable(False)
+            tb.setToolButtonStyle(Qt.ToolButtonIconOnly)
+            tb.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+            tb.addAction(act)
+            return tb
+
+        tb_bold = make_toolbar_for(act_bold)
+        tb_italic = make_toolbar_for(act_italic)
+        tb_color = make_toolbar_for(act_color)
+        tb_list = make_toolbar_for(act_list)
+
+        # --- Frame with header ("Format") around a centered 2×2 grid of toolbars ---
+        format_panel = QFrame()
+        format_panel.setObjectName("formatPanel")
+        format_panel.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+
+        fmt_layout = QVBoxLayout(format_panel)
+        fmt_layout.setContentsMargins(10, 10, 10, 10)
+        fmt_layout.setSpacing(8)
+
+        fmt_title = QLabel("Format")
+        fmt_title.setObjectName("formatPanelTitle")
+        fmt_title.setAlignment(Qt.AlignHCenter)
+        fmt_layout.addWidget(fmt_title, 0)
+
+        fmt_grid_holder = QWidget()
+        fmt_grid = QGridLayout(fmt_grid_holder)
+        fmt_grid.setContentsMargins(0, 0, 0, 0)
+        fmt_grid.setHorizontalSpacing(10)
+        fmt_grid.setVerticalSpacing(10)
+        fmt_grid.addWidget(tb_bold, 0, 0)
+        fmt_grid.addWidget(tb_italic, 0, 1)
+        fmt_grid.addWidget(tb_color, 1, 0)
+        fmt_grid.addWidget(tb_list, 1, 1)
+
+        # center the grid horizontally in the frame
+        center_row = QHBoxLayout()
+        center_row.setContentsMargins(0, 0, 0, 0)
+        center_row.addStretch(1)
+        center_row.addWidget(fmt_grid_holder)
+        center_row.addStretch(1)
+        fmt_layout.addLayout(center_row, 1)
+
+        # Compute a fixed width so the robot panel can match it
+        fmt_margins = fmt_layout.contentsMargins()
+        fmt_width = max(
+            150,
+            fmt_grid_holder.sizeHint().width() + fmt_margins.left() + fmt_margins.right()
+        )
+        format_panel.setFixedWidth(fmt_width)
+
+        # --- Robot panel (left, below format panel; same width) ---
+        robot_panel = QFrame()
+        robot_panel.setObjectName("robotPanel")
+        robot_panel.setFixedWidth(fmt_width)
+        rp_layout = QVBoxLayout(robot_panel)
+        rp_layout.setContentsMargins(0, 0, 10, 10)
+        rp_layout.setSpacing(0)
+        robo_label = QLabel()
+        robo_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignBottom)
+        rp = resource_path("icons/robot_with_bubble_100px.png")
+        if os.path.exists(rp):
+            robo_label.setPixmap(QPixmap(rp))
+        rp_layout.addStretch(1)
+        rp_layout.addWidget(robo_label, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignBottom)
 
         # --- Main content ---
-        central = QWidget(); self.setCentralWidget(central)
+        central = QWidget();
+        self.setCentralWidget(central)
         outer = QVBoxLayout(central)
-        outer.setContentsMargins(18, 20, 18, 20); outer.setSpacing(18)
+        outer.setContentsMargins(18, 20, 18, 20)
+        outer.setSpacing(18)
 
         # Title
-        title_row = QHBoxLayout(); title_row.setSpacing(12)
-        title_label = QLabel("Titel:"); self.title_in = QLineEdit(DEFAULT_EXPORT_TITLE)
-        title_row.addWidget(title_label); title_row.addWidget(self.title_in)
-        outer.addLayout(title_row)
+        title_row = QVBoxLayout();
+        title_row.setSpacing(12)
+        title_label = QLabel("Titel:")
+        title_label.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        title_label.setStyleSheet("""
+            color: #006c8c;   
+            font-weight: bold;
+            font-size: 20px;
+        """)
+        self.title_in = QLineEdit(DEFAULT_EXPORT_TITLE)
+        self.title_in.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        title_row.addWidget(title_label);
+        title_row.addWidget(self.title_in)
+        holder_layout = QHBoxLayout()
+        holder_layout.addStretch()
+        holder_layout.addLayout(title_row)
+        holder_layout.addStretch()
+        outer.addLayout(holder_layout)
         outer.addWidget(make_separator())
 
         # --- Unified table block ---
-        block = QHBoxLayout(); block.setSpacing(12)
+        block = QHBoxLayout();
+        block.setSpacing(12)
 
-        # Right side table shell
-        shell = QVBoxLayout(); shell.setSpacing(8)
+        # LEFT COLUMN: format panel + robot panel stacked
+        left_holder = QWidget()
+        left_holder.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        lh_layout = QVBoxLayout(left_holder)
+        lh_layout.setContentsMargins(0, 0, 0, 0)
+        lh_layout.setSpacing(12)
+        lh_layout.addWidget(format_panel, 0)
+        lh_layout.addWidget(robot_panel, 1, Qt.AlignBottom)
+        block.addWidget(left_holder, 0)
 
-        # Header row (in table)
-        hdr_container = QWidget(); hdr_container.setProperty("class", "KVTable")
-        hdr_l = QHBoxLayout(hdr_container); hdr_l.setContentsMargins(0,0,0,0); hdr_l.setSpacing(0)
-        self.hdr_left  = QLineEdit(DEFAULT_HEADER_LEFT);  self.hdr_left.setReadOnly(True)
-        self.hdr_right = QLineEdit(DEFAULT_HEADER_RIGHT); self.hdr_right.setReadOnly(True)
+        # RIGHT COLUMN: table shell (grid + scroll + footer)
+        shell = QVBoxLayout();
+        shell.setSpacing(12)
+
+        # --- Table grid: headers + input + paste in one layout ---
+        table = QWidget();
+        table.setProperty("class", "KVTable")
+        table_grid = QGridLayout(table)
+        table_grid.setContentsMargins(3, 3, 3, 3)
+        table_grid.setHorizontalSpacing(1)
+        table_grid.setVerticalSpacing(0)
+
+        def vline():
+            ln = QFrame()
+            ln.setFrameShape(QFrame.VLine)
+            ln.setFrameShadow(QFrame.Plain)
+            ln.setStyleSheet("background: #006c8c; min-width:1px; max-width:1px;")
+            return ln
+
+        table_grid.setColumnStretch(0, 1)
+        table_grid.setColumnStretch(2, 2)
+        table_grid.setColumnStretch(4, 0)
+
+        # Row 0: headers
+        self.hdr_left = QLineEdit(DEFAULT_HEADER_LEFT);
+        self.hdr_left.setReadOnly(True)
+        self.hdr_right = QLineEdit(DEFAULT_HEADER_RIGHT);
+        self.hdr_right.setReadOnly(True)
         for e in (self.hdr_left, self.hdr_right):
             e.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
             e.setProperty("class", "HeaderCell")
-        # header edit toggle
+        hdr_actions = QWidget()
+        ha = QHBoxLayout(hdr_actions);
+        ha.setContentsMargins(6, 0, 0, 0);
+        ha.setSpacing(0)
         self.chk_hdr_edit = QCheckBox("Bearbeiten")
         self.chk_hdr_edit.setToolTip("Überschriften bearbeiten")
         self.chk_hdr_edit.toggled.connect(self._on_hdr_edit_toggled)
-
-        hdr_l.addWidget(self.hdr_left, 1)
-        hdr_l.addSpacing(1)
-        hdr_l.addWidget(self.hdr_right, 2)
-        hdr_l.addSpacing(1)
-        hdr_actions = QWidget()
-        ha = QHBoxLayout(hdr_actions); ha.setContentsMargins(6,0,0,0)
         ha.addWidget(self.chk_hdr_edit)
-        hdr_l.addWidget(hdr_actions, 0)
 
-        shell.addWidget(hdr_container)
+        table_grid.addWidget(self.hdr_left, 0, 0)
+        table_grid.addWidget(vline(), 0, 1)
+        table_grid.addWidget(self.hdr_right, 0, 2)
+        table_grid.addWidget(vline(), 0, 3)
+        table_grid.addWidget(hdr_actions, 0, 4, Qt.AlignVCenter)
 
-        # Input row (highlighted) — fixed baseline of ~3 lines, grows as needed
-        input_container = QWidget(); input_container.setProperty("class", "KVTable")
-        input_container.setObjectName("InputRow")
-        input_l = QHBoxLayout(input_container); input_l.setContentsMargins(0,0,0,0); input_l.setSpacing(0)
-        self.key_in = QLineEdit(); self.key_in.setPlaceholderText("Key input")
+        # Row 1: inputs
+        self.key_in = PlainPasteLineEdit()
+        self.key_in.setPlaceholderText("Schlüssel Eingabe")
+        _f = self.key_in.font()
+        _f.setBold(True)
+        self.key_in.setFont(_f)
         self.key_in.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
-        self.val_in = AutoGrowTextEdit(min_lines=3, max_lines=12)
-        self.val_in.setAcceptRichText(True)
-        self.val_in.setPlaceholderText("Value input (Ctrl+Enter bestätigt)")
-        self.confirm_btn = QPushButton("Bestätigen"); self.confirm_btn.setObjectName("primaryButton")
+        self.val_in = PlainPasteTextEdit(min_lines=3, max_lines=12)
+        self.val_in.setPlaceholderText("Wert Eingabe (Ctrl+Enter bestätigt)")
+        self.confirm_btn = QPushButton("Bestätigen");
+        self.confirm_btn.setObjectName("primaryButton")
         self.confirm_btn.clicked.connect(self.confirm_current_input)
         self.key_in.returnPressed.connect(self.confirm_current_input)
         self.val_in.confirm.connect(self.confirm_current_input)
-
-        # keep key cell height in sync with value
         self.val_in.heightChanged.connect(lambda h: self.key_in.setFixedHeight(h))
         self.key_in.setFixedHeight(self.val_in.height())
 
-        input_l.addWidget(self.key_in, 1)
-        input_l.addSpacing(1)
-        input_l.addWidget(self.val_in, 2)
-        input_l.addSpacing(1)
-        input_l.addWidget(self.confirm_btn, 0)
+        table_grid.addWidget(self.key_in, 1, 0)
+        table_grid.addWidget(vline(), 1, 1)
+        table_grid.addWidget(self.val_in, 1, 2)
+        table_grid.addWidget(vline(), 1, 3)
+        table_grid.addWidget(self.confirm_btn, 1, 4, Qt.AlignVCenter)
 
-        shell.addWidget(input_container)
+        # Row 2: paste buttons
+        self.btn_paste_key = QPushButton("Schlüssel einfügen (Zwischenablage)")
+        self.btn_paste_val = QPushButton("Wert einfügen (Zwischenablage)")
+        for b in (self.btn_paste_key, self.btn_paste_val):
+            b.setObjectName("accentSmall")
+            b.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.btn_paste_key.clicked.connect(self.paste_key_plain)
+        self.btn_paste_val.clicked.connect(self.paste_value_plain)
 
-        # Scroll area for created rows ONLY
-        rows_frame = QWidget(); rows_frame.setProperty("class", "KVTable")
-        self.rows_v = QVBoxLayout(rows_frame); self.rows_v.setContentsMargins(0,0,0,0); self.rows_v.setSpacing(0)
-        self.rows_widgets: list[EntryRow] = []
+        confirm_width = self.confirm_btn.sizeHint().width()
+        confirm_spacer = QSpacerItem(confirm_width, 0, QSizePolicy.Fixed, QSizePolicy.Fixed)
+
+        table_grid.addWidget(self.btn_paste_key, 2, 0, Qt.AlignTop)
+        table_grid.addWidget(vline(), 2, 1)
+        table_grid.addWidget(self.btn_paste_val, 2, 2, Qt.AlignTop)
+        table_grid.addWidget(vline(), 2, 3)
+        table_grid.addItem(confirm_spacer, 2, 4, Qt.AlignTop)
+
+        paste_h = max(self.btn_paste_key.sizeHint().height(), self.btn_paste_val.sizeHint().height())
+        table_grid.setRowMinimumHeight(2, paste_h)
+        table_grid.setRowStretch(2, 0)
+        shell.addWidget(table)
+
+        # Rows area (scrolls when necessary)
+        rows_frame = QWidget();
+        rows_frame.setProperty("class", "KVTable")
+        self.rows_v = QVBoxLayout(rows_frame)
+        self.rows_v.setContentsMargins(0, 0, 0, 0)
+        self.rows_v.setSpacing(10)
+        self.rows_v.setAlignment(Qt.AlignTop)
+        self.rows_widgets = []
 
         self.scroll = QScrollArea()
         self.scroll.setFrameShape(QFrame.NoFrame)
@@ -403,24 +602,17 @@ class MainWindow(QMainWindow):
         self.scroll.setMaximumHeight(520)
         shell.addWidget(self.scroll)
 
-        # Export + robot footer
-        footer = QHBoxLayout(); footer.setSpacing(12)
-        self.btn_export = QPushButton("Exportieren"); self.btn_export.setObjectName("primaryButton")
+        # Footer (export)
+        footer = QHBoxLayout();
+        footer.setSpacing(12)
+        self.btn_export = QPushButton("Exportieren");
+        self.btn_export.setObjectName("primaryButton")
         self.btn_export.clicked.connect(self.export_table_only)
-        footer.addStretch(1); footer.addWidget(self.btn_export)
-
-        # robot
-        robo_wrap = QHBoxLayout()
-        robo_label = QLabel()
-        rp = resource_path("icons/robot_gra_100px.png")
-        if os.path.exists(rp):
-            robo_label.setPixmap(QPixmap(rp))
-        robo_wrap.addWidget(robo_label)
-        footer.addLayout(robo_wrap)
+        footer.addStretch(1);
+        footer.addWidget(self.btn_export, alignment=Qt.AlignBottom)
         shell.addLayout(footer)
 
-        # Compose (toolbar left + table right)
-        block.addWidget(self._build_toolbar_widget(tb), 0)
+        # Compose
         block.addLayout(shell, 1)
         outer.addLayout(block)
 
@@ -459,23 +651,46 @@ class MainWindow(QMainWindow):
         self.hdr_left.setReadOnly(not checked)
         self.hdr_right.setReadOnly(not checked)
 
+    def _clipboard_plain_trimmed(self) -> str:
+        cb = QApplication.clipboard()
+        t = cb.text() or ""
+        # normalize line endings and trim only at the ends
+        t = t.replace("\r\n", "\n").replace("\r", "\n")
+        # strip BOM / zero-width / spaces / tabs / newlines only at the ends
+        t = re.sub(r"^\ufeff", "", t)  # BOM at start if present
+        t = re.sub(r"^[\u200B-\u200D\u2060 \t\n]+", "", t)  # leading
+        t = re.sub(r"[\u200B-\u200D\u2060 \t\n]+$", "", t)  # trailing
+        return t
+
+    # Paste helpers (plain text)
+    def paste_key_plain(self):
+        txt = self._clipboard_plain_trimmed()
+        if not txt:
+            return
+        self.key_in.setFocus(Qt.OtherFocusReason)
+        self.key_in.insert(txt)  # QLineEdit: plain text insert
+
+    def paste_value_plain(self):
+        txt = self._clipboard_plain_trimmed()
+        if not txt:
+            return
+        self.val_in.setFocus(Qt.OtherFocusReason)
+        c = self.val_in.textCursor()
+        c.clearSelection()
+        self.val_in.setTextCursor(c)
+        self.val_in.insertPlainText(txt)  # QTextEdit: plain text insert
+
     # Add a persistent row
     def confirm_current_input(self):
         key = self.key_in.text().strip()
         if not key:
             QMessageBox.information(self, "Fehlender Schlüssel", "Bitte Schlüssel eingeben.")
             return
-        # extract inner HTML of value
-        cur = self.val_in.textCursor(); cur.select(QTextCursor.Document)
-        frag = cur.selection().toHtml()
-        start = frag.find("<body"); val_html = ""
-        if start == -1:
-            val_html = _escape_html(self.val_in.toPlainText()).replace("\n", "<br />")
-        else:
-            s2 = frag.find(">", start); e2 = frag.rfind("</body>")
-            val_html = frag[s2+1:e2].strip() if s2 != -1 and e2 != -1 else _escape_html(self.val_in.toPlainText()).replace("\n","<br />")
 
-        row = EntryRow(key, val_html, self.icons)
+        # Preserve lists by taking the ENTIRE document HTML
+        val_html_full = self.val_in.document().toHtml()
+
+        row = EntryRow(key, val_html_full, self.icons)
         row.requestDelete.connect(self._row_delete)
         row.requestMoveUp.connect(self._row_move_up)
         row.requestMoveDown.connect(self._row_move_down)
@@ -483,12 +698,12 @@ class MainWindow(QMainWindow):
         self.rows_widgets.append(row)
         self.rows_v.addWidget(row)
 
-        # clear input row
-        self.key_in.clear(); self.val_in.clear(); self.key_in.setFocus()
+        self.key_in.clear()
+        self.val_in.clear()
+        self.key_in.setFocus()
 
-        # scroll to bottom
-        bar = self.scroll.verticalScrollBar()
-        QTimer.singleShot(0, lambda: bar.setValue(bar.maximum()))
+        if self.scroll.verticalScrollBar().maximum() > 0:
+            self.scroll.ensureWidgetVisible(row)
 
     # Row actions
     def _row_delete(self, row: EntryRow):
@@ -509,7 +724,6 @@ class MainWindow(QMainWindow):
             self._rebuild_rows_layout()
 
     def _rebuild_rows_layout(self):
-        # remove all, re-add in order
         while self.rows_v.count():
             item = self.rows_v.takeAt(0)
             w = item.widget()
