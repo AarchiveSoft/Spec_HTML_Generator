@@ -3,7 +3,9 @@
 
 import sys, os
 import re
-from PySide6.QtCore import Qt, QSize, QTimer, Signal
+import json
+import html as _html
+from PySide6.QtCore import Qt, QSize, QTimer, Signal, QPoint
 from PySide6.QtGui import (
     QAction, QKeySequence, QTextCharFormat, QTextCursor, QTextListFormat,
     QFont, QColor, QGuiApplication, QFontDatabase, QClipboard, QPalette, QIcon, QPixmap
@@ -144,6 +146,21 @@ def apply_brand_theme(app: QApplication):
     QFrame#formatPanel QToolBar#formatToolbar QToolButton {{
         margin: 4px 0;
     }}
+    /* Category rows in the editor */
+    .CategoryCell {{
+        font-weight: 700;
+        background: rgba(0,108,140,0.14);
+        border: 1px solid rgba(0,108,140,0.35);
+        padding: 8px 10px;
+    }}
+    
+    /* Category rows in exported HTML (table) */
+    .specs tr.cat th.category {{
+        background:#e9f3f6;
+        border-color:#c8dde5;
+        text-transform:none;       /* change to uppercase if you prefer */
+        letter-spacing:.2px;
+    }}
     """)
 
 def make_separator() -> QFrame:
@@ -264,6 +281,8 @@ class EntryRow(QWidget):
         super().__init__(parent)
         self.setProperty("class", "KVTable")
 
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
         self.row_layout = QHBoxLayout(self)
         self.row_layout.setContentsMargins(0,0,0,0)
         self.row_layout.setSpacing(0)
@@ -340,6 +359,59 @@ class EntryRow(QWidget):
         if start == -1 or end == -1:
             return _escape_html(self.val.toPlainText()).replace("\n", "<br />")
         return frag[start+1:end].strip()
+
+class CategoryRow(QWidget):
+    requestDelete = Signal(object)
+    requestMoveUp = Signal(object)
+    requestMoveDown = Signal(object)
+    requestFocusToKey = Signal()  # NEW: ask MainWindow to focus the key input
+
+    def __init__(self, title_text: str, icons: dict[str, QIcon], parent=None):
+        super().__init__(parent)
+        self.setProperty("class", "KVTable")
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        self.title = QLineEdit(title_text or "Neuer Abschnitt")
+        f = self.title.font(); f.setBold(True); self.title.setFont(f)
+        self.title.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+        self.title.setProperty("class", "CategoryCell")
+        self.title.setFixedHeight(36)  # visually consistent, tweak if you like
+
+        # ENTER inside the title commits and requests focus back to key input
+        self.title.returnPressed.connect(self._on_return_pressed)
+
+        actions = QWidget()
+        a_lay = QHBoxLayout(actions)
+        a_lay.setContentsMargins(6, 0, 0, 0)
+        a_lay.setSpacing(6)
+
+        self.btn_up = QToolButton();   self.btn_up.setIcon(icons.get("up", QIcon()))
+        self.btn_down = QToolButton(); self.btn_down.setIcon(icons.get("down", QIcon()))
+        self.btn_del = QToolButton();  self.btn_del.setIcon(icons.get("delete", QIcon()))
+        for b, tip in ((self.btn_up, "Nach oben"), (self.btn_down, "Nach unten"), (self.btn_del, "Eintrag löschen")):
+            b.setProperty("class", "rowAction"); b.setToolTip(tip)
+        self.btn_up.clicked.connect(lambda: self.requestMoveUp.emit(self))
+        self.btn_down.clicked.connect(lambda: self.requestMoveDown.emit(self))
+        self.btn_del.clicked.connect(lambda: self.requestDelete.emit(self))
+        a_lay.addWidget(self.btn_up); a_lay.addWidget(self.btn_down); a_lay.addWidget(self.btn_del)
+
+        # Stretch 3 to visually span both "key" (1) and "value" (2) columns
+        lay.addWidget(self.title, 3)
+        lay.addSpacing(1)
+        lay.addWidget(actions, 0)
+
+    def _on_return_pressed(self):
+        # finish edit + bounce focus to the main key input
+        self.title.clearFocus()
+        self.requestFocusToKey.emit()
+
+    def title_plain(self) -> str:
+        return self.title.text().strip()
+
 
 # ---------- Main window ----------
 class MainWindow(QMainWindow):
@@ -421,6 +493,18 @@ class MainWindow(QMainWindow):
         fmt_grid.addWidget(tb_color, 1, 0)
         fmt_grid.addWidget(tb_list, 1, 1)
 
+        # --- Bottom row: add-category button (spans both columns) ---
+        self.btn_add_cat = QPushButton("Kategoriezeile\neinfügen")
+        self.btn_add_cat.setObjectName("accentSmall")
+        self.btn_add_cat.setToolTip("Abschnitts-Überschrift in die Liste einfügen")
+        self.btn_add_cat.clicked.connect(self.add_category_row)  # expects you implemented add_category_row()
+
+        # open button
+        open_button = QPushButton("Öffnen...")
+        open_button.setObjectName("primaryButton")
+        open_button.setShortcut(QKeySequence.Open)
+        open_button.clicked.connect(self.load_from_file)
+
         # center the grid horizontally in the frame
         center_row = QHBoxLayout()
         center_row.setContentsMargins(0, 0, 0, 0)
@@ -450,7 +534,7 @@ class MainWindow(QMainWindow):
         if os.path.exists(rp):
             robo_label.setPixmap(QPixmap(rp))
         rp_layout.addStretch(1)
-        rp_layout.addWidget(robo_label, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignBottom)
+        rp_layout.addWidget(robo_label, 0, Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignHCenter)
 
         # --- Main content ---
         central = QWidget();
@@ -490,7 +574,9 @@ class MainWindow(QMainWindow):
         lh_layout = QVBoxLayout(left_holder)
         lh_layout.setContentsMargins(0, 0, 0, 0)
         lh_layout.setSpacing(12)
+        lh_layout.addWidget(open_button)
         lh_layout.addWidget(format_panel, 0)
+        lh_layout.addWidget(self.btn_add_cat)
         lh_layout.addWidget(robot_panel, 1, Qt.AlignBottom)
         block.addWidget(left_holder, 0)
 
@@ -586,21 +672,33 @@ class MainWindow(QMainWindow):
         table_grid.setRowStretch(2, 0)
         shell.addWidget(table)
 
-        # Rows area (scrolls when necessary)
-        rows_frame = QWidget();
+        # Rows area (scrolls when necessary) — wrapper with bottom stretch
+        rows_frame = QWidget()
         rows_frame.setProperty("class", "KVTable")
+
         self.rows_v = QVBoxLayout(rows_frame)
         self.rows_v.setContentsMargins(0, 0, 0, 0)
         self.rows_v.setSpacing(10)
-        self.rows_v.setAlignment(Qt.AlignTop)
+        # no need to set AlignTop; the wrapper’s stretch handles the extra space
         self.rows_widgets = []
+
+        # wrapper that absorbs extra height below the rows
+        rows_wrap = QWidget()
+        wrap_v = QVBoxLayout(rows_wrap)
+        wrap_v.setContentsMargins(0, 0, 0, 0)
+        wrap_v.setSpacing(0)
+        wrap_v.addWidget(rows_frame, 0)  # natural height of rows
+        wrap_v.addStretch(1)  # eat surplus height at the bottom
 
         self.scroll = QScrollArea()
         self.scroll.setFrameShape(QFrame.NoFrame)
         self.scroll.setWidgetResizable(True)
-        self.scroll.setWidget(rows_frame)
+        self.scroll.setWidget(rows_wrap)  # << important: set wrapper, not rows_frame
+
+        # optional: make the scroll area the thing that grows in the right column
         self.scroll.setMaximumHeight(520)
         shell.addWidget(self.scroll)
+        shell.setStretchFactor(self.scroll, 1)
 
         # Footer (export)
         footer = QHBoxLayout();
@@ -618,7 +716,26 @@ class MainWindow(QMainWindow):
 
         self.statusBar().showMessage("Bereit")
 
-    # Place a QToolBar inside a QWidget so layouts can size it vertically
+    def add_category_row(self):
+        row = CategoryRow("Neuer Abschnitt", self.icons)
+        row.requestDelete.connect(self._row_delete)
+        row.requestMoveUp.connect(self._row_move_up)
+        row.requestMoveDown.connect(self._row_move_down)
+
+        row.requestFocusToKey.connect(lambda: self.key_in.setFocus(Qt.OtherFocusReason))
+
+        self.rows_widgets.append(row)
+        self.rows_v.addWidget(row)
+        # focus it for immediate editing
+        row.title.setFocus()
+        row.title.selectAll()
+
+        self._scroll_row_bottom_into_view(row)
+
+        QTimer.singleShot(0, row.title.setFocus)
+
+    # Place a QToolBar inside a QWidget so layouts ca
+    # n size it vertically
     def _build_toolbar_widget(self, tb: QToolBar) -> QWidget:
         holder = QWidget()
         v = QVBoxLayout(holder); v.setContentsMargins(0,0,0,0); v.addWidget(tb)
@@ -680,6 +797,27 @@ class MainWindow(QMainWindow):
         self.val_in.setTextCursor(c)
         self.val_in.insertPlainText(txt)  # QTextEdit: plain text insert
 
+    def _scroll_row_bottom_into_view(self, row: QWidget | None, extra_px: int = 24):
+        """
+        Scroll so the *bottom* of `row` is visible, with a small margin.
+        Runs twice (0ms and ~40ms) to catch auto-grow after layout settles.
+        """
+
+        def snap():
+            w = self.scroll.widget()
+            if not w or not row or not row.isVisible():
+                return
+            y_top = row.mapTo(w, QPoint(0, 0)).y()
+            y_bottom = y_top + row.height()
+            vp_h = self.scroll.viewport().height()
+            target = y_bottom - vp_h + max(0, extra_px)
+
+            bar = self.scroll.verticalScrollBar()
+            bar.setValue(max(0, min(target, bar.maximum())))
+
+        QTimer.singleShot(0, snap)  # after this event loop turn
+        QTimer.singleShot(40, snap)  # once more after auto-resize/auto-grow
+
     # Add a persistent row
     def confirm_current_input(self):
         key = self.key_in.text().strip()
@@ -698,12 +836,13 @@ class MainWindow(QMainWindow):
         self.rows_widgets.append(row)
         self.rows_v.addWidget(row)
 
+        self._scroll_row_bottom_into_view(row)
+
+        # Clear input and focus back to key
         self.key_in.clear()
         self.val_in.clear()
         self.key_in.setFocus()
 
-        if self.scroll.verticalScrollBar().maximum() > 0:
-            self.scroll.ensureWidgetVisible(row)
 
     # Row actions
     def _row_delete(self, row: EntryRow):
@@ -724,22 +863,27 @@ class MainWindow(QMainWindow):
             self._rebuild_rows_layout()
 
     def _rebuild_rows_layout(self):
+        # clear all items (widgets + spacers)
         while self.rows_v.count():
             item = self.rows_v.takeAt(0)
             w = item.widget()
-            if w: w.setParent(None)
+            if w:
+                w.setParent(None)
+
+        # re-add rows
         for r in self.rows_widgets:
             self.rows_v.addWidget(r)
 
+        # ensure the tail spacer is the final item
+        self.rows_v.addItem(self._tail_spacer)
+        self._scroll_row_bottom_into_view(self.rows_widgets[-1] if self.rows_widgets else None)
+
     # Export exact table
     def export_table_only(self):
-        left_h  = self.hdr_left.text().strip()  or DEFAULT_HEADER_LEFT
+        left_h = self.hdr_left.text().strip() or DEFAULT_HEADER_LEFT
         right_h = self.hdr_right.text().strip() or DEFAULT_HEADER_RIGHT
-        rows = []
-        for rw in self.rows_widgets:
-            k = rw.key_plain(); v = rw.val_html()
-            if k or v: rows.append((k, v))
 
+        # --- Build HTML table (category rows render full-width) ---
         lines = []
         lines.append(SPEC_TABLE_CSS)
         lines.append(f'<table border="1" class="specs">')
@@ -750,15 +894,50 @@ class MainWindow(QMainWindow):
         lines.append("\t\t</tr>")
         lines.append("\t</thead>")
         lines.append("\t<tbody>")
-        for key_plain, val_html in rows:
-            lines.append("\t\t<tr>")
-            lines.append(f"\t\t\t<th>{_escape_html(key_plain)}</th>")
-            lines.append(f"\t\t\t<td>{val_html}</td>")
-            lines.append("\t\t</tr>")
+
+        rows_meta = []  # for JSON snapshot v2
+
+        for rw in self.rows_widgets:
+            # Category row?
+            try:
+                from types import SimpleNamespace
+                is_category = hasattr(rw, "title_plain") and not hasattr(rw, "key_plain")
+            except Exception:
+                is_category = False
+
+            if is_category:
+                title = _escape_html(rw.title_plain())
+                lines.append('\t\t<tr class="cat">')
+                lines.append(f'\t\t\t<th class="category" colspan="2">{title}</th>')
+                lines.append('\t\t</tr>')
+                rows_meta.append({"type": "cat", "title": rw.title_plain()})
+            else:
+                # Key/Value row
+                k = _escape_html(rw.key_plain())
+                v = rw.val_html()
+                # Skip completely empty rows
+                if not (k or v):
+                    continue
+                lines.append("\t\t<tr>")
+                lines.append(f"\t\t\t<th>{k}</th>")
+                lines.append(f"\t\t\t<td>{v}</td>")
+                lines.append("\t\t</tr>")
+                rows_meta.append({"type": "kv", "key": rw.key_plain(), "value_html": v})
+
         lines.append("\t</tbody>")
         lines.append("</table>")
+
+        # --- Embed a JSON snapshot for perfect round-trip (version 2 supports categories) ---
+        snapshot = {
+            "headers": {"left": left_h, "right": right_h},
+            "rows"   : rows_meta,
+            "version": 2,
+        }
+        lines.append(f"\n<!-- SPECS_EDITOR_v2 {json.dumps(snapshot, ensure_ascii=False)} -->\n")
+
         out = "\n".join(lines)
 
+        # --- Save dialog ---
         base = self.title_in.text().strip() or DEFAULT_EXPORT_TITLE
         base = "".join(ch if ch.isalnum() or ch in (" ", "-", "_") else "_" for ch in base).strip()
         base = "_".join(base.split()) or DEFAULT_EXPORT_TITLE
@@ -767,13 +946,132 @@ class MainWindow(QMainWindow):
             self, "Save (paste-ready HTML)", default_name,
             "Text/HTML (*.txt *.html *.htm);;All Files (*.*)"
         )
-        if not path: return
+        if not path:
+            return
         try:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(out)
             self.statusBar().showMessage(f"Saved to {path}", 4000)
         except Exception as e:
             QMessageBox.critical(self, "Save error", str(e))
+
+    def _parse_specs_file(self, content: str):
+        """
+        Returns: (left_header, right_header, rows)
+        rows is a list of tuples: (key_plain, value_html)
+        1) Prefer embedded JSON snapshot.
+        2) Fallback to simple regex table parse for legacy files.
+        """
+        # 1) Embedded JSON?
+        m = re.search(r'<!--\s*SPECS_EDITOR_v(\d+)\s*(\{.*\})\s*-->', content, re.DOTALL)
+        if m:
+            try:
+                ver = int(m.group(1))
+                meta = json.loads(m.group(2))
+                h_left = meta.get("headers", {}).get("left", DEFAULT_HEADER_LEFT)
+                h_right = meta.get("headers", {}).get("right", DEFAULT_HEADER_RIGHT)
+                rows_meta = meta.get("rows", []) or []
+
+                rows = []
+                if ver >= 2:
+                    for r in rows_meta:
+                        if r.get("type") == "cat":
+                            rows.append(("__CAT__", r.get("title", "")))  # sentinel form
+                        else:
+                            rows.append((r.get("key", ""), r.get("value_html", "")))
+                else:
+                    # v1 = only KV rows
+                    rows = [(r.get("key", ""), r.get("value_html", "")) for r in rows_meta]
+
+                return h_left, h_right, rows
+            except Exception:
+                pass
+
+        # 2) Fallback: parse the table we export (predictable structure)
+        # headers
+        mh = re.search(
+            r'<thead>.*?<tr>\s*<th>(.*?)</th>\s*<th>(.*?)</th>\s*</tr>.*?</thead>',
+            content, re.DOTALL | re.IGNORECASE
+        )
+        if mh:
+            h_left = _html.unescape(mh.group(1).strip())
+            h_right = _html.unescape(mh.group(2).strip())
+        else:
+            h_left, h_right = DEFAULT_HEADER_LEFT, DEFAULT_HEADER_RIGHT
+
+        # body rows
+        mt = re.search(r'<tbody>(.*?)</tbody>', content, re.DOTALL | re.IGNORECASE)
+        rows = []
+        if mt:
+            tbody = mt.group(1)
+            # additionally detect category rows like: <tr class="cat"><th class="category" colspan="2">Title</th></tr>
+            for mcat in re.finditer(
+                    r'<tr[^>]*class="[^"]*\bcat\b[^"]*"[^>]*>\s*<th[^>]*class="[^"]*\bcategory\b[^"]*"[^>]*colspan="2"[^>]*>(.*?)</th>\s*</tr>',
+                    content, re.DOTALL | re.IGNORECASE
+            ):
+                title = _html.unescape(mcat.group(1).strip())
+                rows.append(("__CAT__", title))
+            for mrow in re.finditer(
+                    r'<tr>\s*<th>(.*?)</th>\s*<td>(.*?)</td>\s*</tr>',
+                    tbody, re.DOTALL | re.IGNORECASE
+            ):
+                key_plain = _html.unescape(mrow.group(1).strip())
+                value_html = mrow.group(2).strip()  # keep inner HTML intact
+                rows.append((key_plain, value_html))
+
+        return h_left, h_right, rows
+
+    def load_from_file(self):
+        """
+        File → headers + rows → repopulate UI.
+        Preserves rich HTML in value cells; keys are plain text (bold in UI).
+        """
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Öffnen", "", "Text/HTML (*.txt *.html *.htm);;All Files (*.*)"
+        )
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+        except Exception as e:
+            QMessageBox.critical(self, "Ladefehler", str(e))
+            return
+
+        left_h, right_h, rows = self._parse_specs_file(content)
+
+        # Set headers
+        self.hdr_left.setText(left_h or DEFAULT_HEADER_LEFT)
+        self.hdr_right.setText(right_h or DEFAULT_HEADER_RIGHT)
+
+        # Clear current rows
+        self.rows_widgets.clear()
+        # Remove all layout items
+        while self.rows_v.count():
+            item = self.rows_v.takeAt(0)
+            w = item.widget()
+            if w:
+                w.setParent(None)
+
+        # Re-add rows + tail spacer so rows pin to top
+        for key_plain, value_html in rows:
+            if key_plain == "__CAT__":
+                row = CategoryRow(value_html, self.icons)  # value_html holds the title here
+            else:
+                row = EntryRow(key_plain, value_html, self.icons)
+            row.requestDelete.connect(self._row_delete)
+            row.requestMoveUp.connect(self._row_move_up)
+            row.requestMoveDown.connect(self._row_move_down)
+            self.rows_widgets.append(row)
+            self.rows_v.addWidget(row)
+
+        # tail spacer
+        self.tail_spacer = QSpacerItem(0, 0, QSizePolicy.Minimum, QSizePolicy.Expanding)
+        self.rows_v.addItem(self.tail_spacer)
+
+        # Focus the input row ready for edits
+        self.key_in.setFocus()
+
 
 def main():
     app = QApplication(sys.argv)
