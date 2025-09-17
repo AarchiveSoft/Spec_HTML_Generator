@@ -26,12 +26,22 @@ ACCENT = "#006c8c"
 
 SPEC_TABLE_CSS = """
 <style type="text/css">
-table.specs {width:100%; border-collapse:collapse; font-family:Arial, Helvetica, sans-serif; font-size:14px;}
-      .specs th, .specs td {border:1px solid #ddd; padding:8px; vertical-align:top;}
-      .specs th {background:#f5f5f5; text-align:left; width:30%;}
-      .specs tr:nth-child(even){background:#fafafa;}
-      ul {margin:6px 0 6px 18px; padding:0;}</style>
+table.specs{width:100%;border-collapse:collapse;font-family:Arial, Helvetica, sans-serif;font-size:14px;}
+.specs th,.specs td{border:1px solid #ddd;padding:8px;vertical-align:top;box-sizing:border-box;}
+.specs th{background:#f5f5f5;text-align:left;width:30%;}
+.specs tr:nth-child(even){background:#fafafa;}
+
+/* Make all rich content inherit the table font/size */
+.specs td,.specs td *{font-family:inherit !important;font-size:inherit !important;line-height:1.4;}
+
+/* Lists stay inside the cell border and wrap nicely */
+.specs td ul,.specs td ol{margin:6px 0;padding-left:1.25em;list-style-position:outside;}
+.specs td li{margin:0.15em 0;}
+.specs td p{margin:0.3em 0;}
+.specs td *{max-width:100%;word-break:break-word;overflow-wrap:anywhere;}
+</style>
 """.strip()
+
 
 # ---------- helpers / theme ----------
 def resource_path(relative_path):
@@ -170,6 +180,24 @@ def _escape_html(text: str) -> str:
     return (text.replace("&", "&amp;").replace("<", "&lt;")
                 .replace(">", "&gt;").replace('"', "&quot;"))
 
+def _normalize_for_paste(t: str) -> str:
+    # Map ß/ẞ → ss/SS (idempotent)
+    return (t or "").replace("ß", "ss").replace("ẞ", "SS")
+
+def _sanitize_value_html(html: str) -> str:
+    # remove only font-family/font-size and Qt-specific noise from inline styles
+    def _clean_style(m):
+        style = m.group(1)
+        style = re.sub(r'(?:^|;)\s*(font-family|font-size)\s*:\s*[^;]+;?', ';', style, flags=re.I)
+        style = re.sub(r'(?:^|;)\s*-qt-[^;]+;?', ';', style, flags=re.I)
+        style = re.sub(r';{2,}', ';', style).strip(' ;')
+        return f' style="{style}"' if style else ''
+    html = re.sub(r'\sstyle="([^"]*)"', _clean_style, html, flags=re.I)
+    # drop spans that became empty after cleaning
+    html = re.sub(r'<span(?:\sstyle="")?\s*>(.*?)</span>', r'\1', html, flags=re.I|re.S)
+    return html
+
+
 # ---------- Rich text + auto-grow ----------
 class RichTextArea(QTextEdit):
     confirm = Signal()   # Ctrl+Enter
@@ -183,13 +211,13 @@ class RichTextArea(QTextEdit):
     def insertFromMimeData(self, source):
         text = source.text()
         if text:
-            self.insertPlainText(text)
+            self.insertPlainText(_normalize_for_paste(text))  # <— add
         else:
             super().insertFromMimeData(source)
 
     def paste(self):
         cb = QApplication.clipboard()
-        self.insertPlainText(cb.text() or "")
+        self.insertPlainText(_normalize_for_paste(cb.text() or ""))  # <— add
 
     def toggle_bold(self):
         fmt = QTextCharFormat()
@@ -202,7 +230,7 @@ class RichTextArea(QTextEdit):
         self.mergeCurrentCharFormat(fmt)
 
     def pick_color(self):
-        c = QColorDialog.getColor(self.textColor(), self, "Choose text color")
+        c = QColorDialog.getColor(self.textColor(), self, "Textfarbe wählen")
         if c.isValid():
             fmt = QTextCharFormat(); fmt.setForeground(c); self.mergeCurrentCharFormat(fmt)
 
@@ -252,10 +280,12 @@ class AutoGrowTextEdit(RichTextArea):
 
 class PlainPasteLineEdit(QLineEdit):
     """QLineEdit that always pastes plain text, collapsing whitespace."""
+
     def insertFromMimeData(self, source):
         text = source.text()  # ignore rich content
         t = (text or "").replace("\r\n", "\n").replace("\r", "\n").replace("\u00A0", " ")
         t = re.sub(r"\s+", " ", t).strip()  # single line
+        t = _normalize_for_paste(t)  # <— add
         self.insert(t)
 
 class PlainPasteTextEdit(AutoGrowTextEdit):
@@ -268,7 +298,8 @@ class PlainPasteTextEdit(AutoGrowTextEdit):
     def insertFromMimeData(self, source):
         text = source.text()  # ignore rich content/HTML
         t = (text or "").replace("\r\n", "\n").replace("\r", "\n")
-        t = t.strip("\n")  # keep inner newlines
+        t = t.strip("\n")
+        t = _normalize_for_paste(t)  # <— add
         self.insertPlainText(t)
 
 # ---------- Entry row with actions ----------
@@ -349,7 +380,8 @@ class EntryRow(QWidget):
         return self.key.text().strip()
 
     def val_html(self) -> str:
-        cur = self.val.textCursor(); cur.select(QTextCursor.Document)
+        cur = self.val.textCursor();
+        cur.select(QTextCursor.Document)
         frag = cur.selection().toHtml()
         start = frag.find("<body")
         if start == -1:
@@ -358,7 +390,9 @@ class EntryRow(QWidget):
         end = frag.rfind("</body>")
         if start == -1 or end == -1:
             return _escape_html(self.val.toPlainText()).replace("\n", "<br />")
-        return frag[start+1:end].strip()
+        inner = frag[start + 1:end].strip()
+        return _sanitize_value_html(inner)  # <— apply the cleaner
+
 
 class CategoryRow(QWidget):
     requestDelete = Signal(object)
@@ -628,13 +662,13 @@ class MainWindow(QMainWindow):
 
         # Row 1: inputs
         self.key_in = PlainPasteLineEdit()
-        self.key_in.setPlaceholderText("Schlüssel Eingabe")
+        self.key_in.setPlaceholderText("Schlüssel Eingeben")
         _f = self.key_in.font()
         _f.setBold(True)
         self.key_in.setFont(_f)
         self.key_in.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
         self.val_in = PlainPasteTextEdit(min_lines=3, max_lines=12)
-        self.val_in.setPlaceholderText("Wert Eingabe (Ctrl+Enter bestätigt)")
+        self.val_in.setPlaceholderText("Wert Eingeben (Ctrl+Enter bestätigt)")
         self.confirm_btn = QPushButton("Bestätigen");
         self.confirm_btn.setObjectName("primaryButton")
         self.confirm_btn.clicked.connect(self.confirm_current_input)
@@ -777,7 +811,7 @@ class MainWindow(QMainWindow):
         t = re.sub(r"^\ufeff", "", t)  # BOM at start if present
         t = re.sub(r"^[\u200B-\u200D\u2060 \t\n]+", "", t)  # leading
         t = re.sub(r"[\u200B-\u200D\u2060 \t\n]+$", "", t)  # trailing
-        return t
+        return _normalize_for_paste(t)
 
     # Paste helpers (plain text)
     def paste_key_plain(self):
@@ -863,7 +897,7 @@ class MainWindow(QMainWindow):
             self._rebuild_rows_layout()
 
     def _rebuild_rows_layout(self):
-        # clear all items (widgets + spacers)
+        # clear all items currently in the layout
         while self.rows_v.count():
             item = self.rows_v.takeAt(0)
             w = item.widget()
@@ -874,8 +908,7 @@ class MainWindow(QMainWindow):
         for r in self.rows_widgets:
             self.rows_v.addWidget(r)
 
-        # ensure the tail spacer is the final item
-        self.rows_v.addItem(self._tail_spacer)
+        # the bottom “stretch” is handled by the wrapper (rows_wrap.addStretch(1))
         self._scroll_row_bottom_into_view(self.rows_widgets[-1] if self.rows_widgets else None)
 
     # Export exact table
@@ -886,7 +919,7 @@ class MainWindow(QMainWindow):
         # --- Build HTML table (category rows render full-width) ---
         lines = []
         lines.append(SPEC_TABLE_CSS)
-        lines.append(f'<table border="1" class="specs">')
+        lines.append('<table border="1" class="specs">')
         lines.append("\t<thead>")
         lines.append("\t\t<tr>")
         lines.append(f"\t\t\t<th>{_escape_html(left_h)}</th>")
@@ -895,45 +928,26 @@ class MainWindow(QMainWindow):
         lines.append("\t</thead>")
         lines.append("\t<tbody>")
 
-        rows_meta = []  # for JSON snapshot v2
-
         for rw in self.rows_widgets:
             # Category row?
-            try:
-                from types import SimpleNamespace
-                is_category = hasattr(rw, "title_plain") and not hasattr(rw, "key_plain")
-            except Exception:
-                is_category = False
-
+            is_category = hasattr(rw, "title_plain") and not hasattr(rw, "key_plain")
             if is_category:
                 title = _escape_html(rw.title_plain())
                 lines.append('\t\t<tr class="cat">')
                 lines.append(f'\t\t\t<th class="category" colspan="2">{title}</th>')
                 lines.append('\t\t</tr>')
-                rows_meta.append({"type": "cat", "title": rw.title_plain()})
             else:
-                # Key/Value row
                 k = _escape_html(rw.key_plain())
                 v = rw.val_html()
-                # Skip completely empty rows
                 if not (k or v):
                     continue
                 lines.append("\t\t<tr>")
                 lines.append(f"\t\t\t<th>{k}</th>")
                 lines.append(f"\t\t\t<td>{v}</td>")
                 lines.append("\t\t</tr>")
-                rows_meta.append({"type": "kv", "key": rw.key_plain(), "value_html": v})
 
         lines.append("\t</tbody>")
         lines.append("</table>")
-
-        # --- Embed a JSON snapshot for perfect round-trip (version 2 supports categories) ---
-        snapshot = {
-            "headers": {"left": left_h, "right": right_h},
-            "rows"   : rows_meta,
-            "version": 2,
-        }
-        lines.append(f"\n<!-- SPECS_EDITOR_v2 {json.dumps(snapshot, ensure_ascii=False)} -->\n")
 
         out = "\n".join(lines)
 
@@ -943,7 +957,7 @@ class MainWindow(QMainWindow):
         base = "_".join(base.split()) or DEFAULT_EXPORT_TITLE
         default_name = f"{base}.txt"
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save (paste-ready HTML)", default_name,
+            self, "Speichern (einfügefertiges HTML)", default_name,
             "Text/HTML (*.txt *.html *.htm);;All Files (*.*)"
         )
         if not path:
@@ -951,18 +965,18 @@ class MainWindow(QMainWindow):
         try:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(out)
-            self.statusBar().showMessage(f"Saved to {path}", 4000)
+            self.statusBar().showMessage(f"Gespeichert unter: {path}", 4000)
         except Exception as e:
-            QMessageBox.critical(self, "Save error", str(e))
+            QMessageBox.critical(self, "Speicherfehler", str(e))
 
     def _parse_specs_file(self, content: str):
         """
         Returns: (left_header, right_header, rows)
         rows is a list of tuples: (key_plain, value_html)
-        1) Prefer embedded JSON snapshot.
-        2) Fallback to simple regex table parse for legacy files.
+        1) Prefer embedded JSON snapshot (for old files).
+        2) Otherwise reverse from the <table class="specs"> in order.
         """
-        # 1) Embedded JSON?
+        # 1) Embedded JSON? (kept for backward compatibility)
         m = re.search(r'<!--\s*SPECS_EDITOR_v(\d+)\s*(\{.*\})\s*-->', content, re.DOTALL)
         if m:
             try:
@@ -976,18 +990,16 @@ class MainWindow(QMainWindow):
                 if ver >= 2:
                     for r in rows_meta:
                         if r.get("type") == "cat":
-                            rows.append(("__CAT__", r.get("title", "")))  # sentinel form
+                            rows.append(("__CAT__", r.get("title", "")))
                         else:
                             rows.append((r.get("key", ""), r.get("value_html", "")))
                 else:
-                    # v1 = only KV rows
                     rows = [(r.get("key", ""), r.get("value_html", "")) for r in rows_meta]
-
                 return h_left, h_right, rows
             except Exception:
                 pass
 
-        # 2) Fallback: parse the table we export (predictable structure)
+        # 2) Fallback: parse the exported table in document order
         # headers
         mh = re.search(
             r'<thead>.*?<tr>\s*<th>(.*?)</th>\s*<th>(.*?)</th>\s*</tr>.*?</thead>',
@@ -999,25 +1011,32 @@ class MainWindow(QMainWindow):
         else:
             h_left, h_right = DEFAULT_HEADER_LEFT, DEFAULT_HEADER_RIGHT
 
-        # body rows
+        # tbody
         mt = re.search(r'<tbody>(.*?)</tbody>', content, re.DOTALL | re.IGNORECASE)
         rows = []
         if mt:
             tbody = mt.group(1)
-            # additionally detect category rows like: <tr class="cat"><th class="category" colspan="2">Title</th></tr>
-            for mcat in re.finditer(
-                    r'<tr[^>]*class="[^"]*\bcat\b[^"]*"[^>]*>\s*<th[^>]*class="[^"]*\bcategory\b[^"]*"[^>]*colspan="2"[^>]*>(.*?)</th>\s*</tr>',
-                    content, re.DOTALL | re.IGNORECASE
-            ):
-                title = _html.unescape(mcat.group(1).strip())
-                rows.append(("__CAT__", title))
-            for mrow in re.finditer(
-                    r'<tr>\s*<th>(.*?)</th>\s*<td>(.*?)</td>\s*</tr>',
-                    tbody, re.DOTALL | re.IGNORECASE
-            ):
-                key_plain = _html.unescape(mrow.group(1).strip())
-                value_html = mrow.group(2).strip()  # keep inner HTML intact
-                rows.append((key_plain, value_html))
+            # iterate <tr> in order and decide per row
+            for mtr in re.finditer(r'<tr[^>]*>(.*?)</tr>', tbody, re.DOTALL | re.IGNORECASE):
+                tr_html = mtr.group(0)
+
+                # category row?
+                if re.search(r'class="[^"]*\bcat\b[^"]*"', tr_html, re.IGNORECASE):
+                    mtitle = re.search(
+                        r'<th[^>]*class="[^"]*\bcategory\b[^"]*"[^>]*colspan="2"[^>]*>(.*?)</th>',
+                        tr_html, re.DOTALL | re.IGNORECASE
+                    )
+                    title = _html.unescape(mtitle.group(1).strip()) if mtitle else ""
+                    rows.append(("__CAT__", title))
+                    continue
+
+                # kv row
+                mk = re.search(r'<th>(.*?)</th>', tr_html, re.DOTALL | re.IGNORECASE)
+                mv = re.search(r'<td>(.*?)</td>', tr_html, re.DOTALL | re.IGNORECASE)
+                if mk and mv:
+                    key_plain = _html.unescape(mk.group(1).strip())
+                    value_html = (mv.group(1) or "").strip()
+                    rows.append((key_plain, value_html))
 
         return h_left, h_right, rows
 
@@ -1027,7 +1046,7 @@ class MainWindow(QMainWindow):
         Preserves rich HTML in value cells; keys are plain text (bold in UI).
         """
         path, _ = QFileDialog.getOpenFileName(
-            self, "Öffnen", "", "Text/HTML (*.txt *.html *.htm);;All Files (*.*)"
+            self, "Öffnen", "", "Text/HTML (*.txt *.html *.htm);;Alle Dateien (*.*)"
         )
         if not path:
             return
@@ -1064,10 +1083,6 @@ class MainWindow(QMainWindow):
             row.requestMoveDown.connect(self._row_move_down)
             self.rows_widgets.append(row)
             self.rows_v.addWidget(row)
-
-        # tail spacer
-        self.tail_spacer = QSpacerItem(0, 0, QSizePolicy.Minimum, QSizePolicy.Expanding)
-        self.rows_v.addItem(self.tail_spacer)
 
         # Focus the input row ready for edits
         self.key_in.setFocus()
