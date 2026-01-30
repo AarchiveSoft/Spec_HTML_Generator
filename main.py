@@ -28,7 +28,8 @@ SPEC_TABLE_CSS = """
 <style type="text/css">
 table.specs{width:100%;border-collapse:collapse;font-family:Arial, Helvetica, sans-serif;font-size:14px;}
 .specs th,.specs td{border:1px solid #ddd;padding:8px;vertical-align:top;box-sizing:border-box;}
-.specs th{background:#f5f5f5;text-align:left;width:30%;}
+.specs th{background:#f5f5f5;text-align:right;width:30%;}
+.specs th.category, .specs thead th:last-child{text-align:left;}
 .specs tr:nth-child(even){background:#fafafa;}
 
 /* Make all rich content inherit the table font/size */
@@ -323,7 +324,7 @@ class EntryRow(QWidget):
         kf = self.key.font()
         kf.setBold(True)
         self.key.setFont(kf)
-        self.key.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+        self.key.setAlignment(Qt.AlignVCenter | Qt.AlignRight)
 
         self.val = AutoGrowTextEdit(min_lines=3, max_lines=12)
         self.val.setAcceptRichText(True)
@@ -643,7 +644,10 @@ class MainWindow(QMainWindow):
         self.hdr_right = QLineEdit(DEFAULT_HEADER_RIGHT);
         self.hdr_right.setReadOnly(True)
         for e in (self.hdr_left, self.hdr_right):
-            e.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+            if e == self.hdr_left:
+                e.setAlignment(Qt.AlignVCenter | Qt.AlignRight)
+            else:
+                e.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
             e.setProperty("class", "HeaderCell")
         hdr_actions = QWidget()
         ha = QHBoxLayout(hdr_actions);
@@ -666,7 +670,7 @@ class MainWindow(QMainWindow):
         _f = self.key_in.font()
         _f.setBold(True)
         self.key_in.setFont(_f)
-        self.key_in.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+        self.key_in.setAlignment(Qt.AlignVCenter | Qt.AlignRight)
         self.val_in = PlainPasteTextEdit(min_lines=3, max_lines=12)
         self.val_in.setPlaceholderText("Wert Eingeben (Ctrl+Enter bestätigt)")
         self.confirm_btn = QPushButton("Bestätigen");
