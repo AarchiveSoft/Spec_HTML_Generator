@@ -1,11 +1,12 @@
 # specs_editor.py
-# Requirements: Python 3.9+  ->  pip install PySide6
+# Requirements: Python 3.9+  ->  pip install PySide6 requests packaging
 
 import sys, os
 import re
 import json
 import html as _html
-from PySide6.QtCore import Qt, QSize, QTimer, Signal, QPoint
+from datetime import datetime
+from PySide6.QtCore import Qt, QSize, QTimer, Signal, QPoint, Slot, QThread, QStandardPaths
 from PySide6.QtGui import (
     QAction, QKeySequence, QTextCharFormat, QTextCursor, QTextListFormat,
     QFont, QColor, QGuiApplication, QFontDatabase, QClipboard, QPalette, QIcon, QPixmap
@@ -14,15 +15,56 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QToolBar, QVBoxLayout, QHBoxLayout,
     QLabel, QTextEdit, QLineEdit, QPushButton, QFileDialog, QMessageBox,
     QColorDialog, QCheckBox, QFrame, QSizePolicy, QScrollArea, QGridLayout,
-    QToolButton, QSpacerItem
+    QToolButton, QSpacerItem, QInputDialog, QProgressDialog
 )
 
-APP_TITLE = "Claudias Spezifikationen Assistent"
+# Web scraping deps (optional until used)
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options as ChromeOptions
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.edge.options import Options as EdgeOptions
+from selenium.common.exceptions import WebDriverException
+from bs4 import BeautifulSoup
+
+# Import auto-update module (graceful fallback if not available)
+try:
+    import auto_update
+    AUTO_UPDATE_AVAILABLE = True
+except ImportError:
+    AUTO_UPDATE_AVAILABLE = False
+
+APP_TITLE = "Claudias Listenwichtel"
 
 DEFAULT_HEADER_LEFT  = "Kategorie"
 DEFAULT_HEADER_RIGHT = "Details"
 DEFAULT_EXPORT_TITLE = "Technische_Daten"
-ACCENT = "#006c8c"
+ACCENT = "#006B8D"
+HEADER_ROW_STYLE = "fill"  # "text" or "fill"
+SCRAPE_HEADLESS = False
+SCRAPE_HEADLESS_MODE = "old"  # "new" or "old"
+
+SECTION_ROW_TEXT_COLOR = ACCENT if HEADER_ROW_STYLE == "text" else "#ffffff"
+SECTION_ROW_BG_COLOR = "transparent" if HEADER_ROW_STYLE == "text" else ACCENT
+
+EXPORT_HEADER_TEXT_COLOR = ACCENT if HEADER_ROW_STYLE == "text" else "#ffffff"
+EXPORT_HEADER_BG_COLOR = "transparent" if HEADER_ROW_STYLE == "text" else ACCENT
+EXPORT_HEADER_FONT_SIZE_PX = 16
+EXPORT_SECTION_FONT_SIZE_PX = 16
+EXPORT_HEADER_PADDING_Y_PX = 10
+EXPORT_SECTION_PADDING_Y_PX = 10
+EXPORT_HEADER_CENTER = False
+
+SCRAPE_EXCLUDE_KEYS = {
+    "eans inkl. varianten und bundles",
+    "unverb. preisempfehlung*",
+    "internet-preis",
+    "optionales zubehör",
+}
+SCRAPE_EXCLUDE_SECTIONS = {
+    "weiterführende links",
+}
 
 SPEC_TABLE_CSS = """
 <style type="text/css">
@@ -31,6 +73,15 @@ table.specs{width:100%;border-collapse:collapse;font-family:Arial, Helvetica, sa
 .specs th{background:#f5f5f5;text-align:right;width:30%;}
 .specs th.category, .specs thead th:last-child{text-align:left;}
 .specs tr:nth-child(even){background:#fafafa;}
+.specs thead th{
+    color: __HEADER_COLOR__;
+    font-size: __HEADER_FONT_PX__px;
+    padding-top: __HEADER_PAD_Y_PX__px;
+    padding-bottom: __HEADER_PAD_Y_PX__px;
+    background: __HEADER_BG__;
+}
+.specs thead th:first-child{text-align:__HEADER_ALIGN_LEFT__;}
+.specs thead th:last-child{text-align:__HEADER_ALIGN_RIGHT__;}
 
 /* Make all rich content inherit the table font/size */
 .specs td,.specs td *{font-family:inherit !important;font-size:inherit !important;line-height:1.4;}
@@ -42,6 +93,22 @@ table.specs{width:100%;border-collapse:collapse;font-family:Arial, Helvetica, sa
 .specs td *{max-width:100%;word-break:break-word;overflow-wrap:anywhere;}
 </style>
 """.strip()
+SPEC_TABLE_CSS = (SPEC_TABLE_CSS
+    .replace("__HEADER_COLOR__", EXPORT_HEADER_TEXT_COLOR)
+    .replace("__HEADER_FONT_PX__", str(EXPORT_HEADER_FONT_SIZE_PX))
+    .replace("__HEADER_PAD_Y_PX__", str(EXPORT_HEADER_PADDING_Y_PX))
+    .replace("__HEADER_BG__", EXPORT_HEADER_BG_COLOR)
+    .replace("__HEADER_ALIGN_LEFT__", "center" if EXPORT_HEADER_CENTER else "right")
+    .replace("__HEADER_ALIGN_RIGHT__", "center" if EXPORT_HEADER_CENTER else "left")
+)
+SPEC_TABLE_CSS = SPEC_TABLE_CSS.replace(
+    "</style>",
+    f".specs tr.section th.section{{text-align:center;font-weight:700;"
+    f"color:{SECTION_ROW_TEXT_COLOR};background:{SECTION_ROW_BG_COLOR};"
+    f"font-size:{EXPORT_SECTION_FONT_SIZE_PX}px;"
+    f"padding-top:{EXPORT_SECTION_PADDING_Y_PX}px;"
+    f"padding-bottom:{EXPORT_SECTION_PADDING_Y_PX}px;}}\n</style>"
+)
 
 
 # ---------- helpers / theme ----------
@@ -164,6 +231,16 @@ def apply_brand_theme(app: QApplication):
         border: 1px solid rgba(0,108,140,0.35);
         padding: 8px 10px;
     }}
+
+    /* Section/header rows in the editor */
+    .SectionCell {{
+        font-weight: 700;
+        text-align: center;
+        color: {SECTION_ROW_TEXT_COLOR};
+        background: {SECTION_ROW_BG_COLOR};
+        border: 1px solid rgba(0,108,140,0.35);
+        padding: 8px 10px;
+    }}
     
     /* Category rows in exported HTML (table) */
     .specs tr.cat th.category {{
@@ -197,6 +274,75 @@ def _sanitize_value_html(html: str) -> str:
     # drop spans that became empty after cleaning
     html = re.sub(r'<span(?:\sstyle="")?\s*>(.*?)</span>', r'\1', html, flags=re.I|re.S)
     return html
+
+def _scrape_log(msg: str):
+    try:
+        os.makedirs("output", exist_ok=True)
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(os.path.join("output", "scrape.log"), "a", encoding="utf-8") as f:
+            f.write(f"[{ts}] {msg}\n")
+    except Exception:
+        pass
+
+def _clean_scraped_value(raw_text: str) -> str:
+    # Normalize and split into lines
+    txt = _normalize_for_paste(raw_text or "")
+    lines = [ln.strip() for ln in txt.splitlines()]
+    lines = [ln for ln in lines if ln]
+
+    merged = []
+    for ln in lines:
+        low = ln.lower()
+        if "weitere" in low:
+            continue
+        if low == "vergleichen":
+            continue
+        if ln in ("(", ")"):
+            continue
+
+        if merged:
+            prev = merged[-1]
+            # join parenthetical fragments
+            if ln.startswith("("):
+                merged[-1] = f"{prev} {ln}"
+                continue
+            # join numeric parts after a parenthetical (e.g., ") 30")
+            if re.match(r"^\d+$", ln) and prev.endswith(")"):
+                merged[-1] = f"{prev} {ln}"
+                continue
+            # join codecs into parentheses
+            if ln.startswith("Codec "):
+                merged[-1] = f"{prev} ({ln})"
+                continue
+            # join resolution fragments like "8.640 x" + "5.760"
+            if prev.rstrip().endswith("x") and re.match(r"^\d", ln):
+                merged[-1] = f"{prev} {ln}"
+                continue
+            # join frame rate fragment like "30p" or "30p,"
+            if re.match(r"^\d+p,?$", ln):
+                merged[-1] = f"{prev} {ln}"
+                continue
+            # join lone "p" after a number
+            if ln in ("p", "P") and re.search(r"\b\d+$", prev):
+                merged[-1] = f"{prev}{ln}"
+                continue
+            # join after trailing comma
+            if prev.endswith(","):
+                merged[-1] = f"{prev} {ln}"
+                continue
+
+        merged.append(ln)
+
+    # split at semicolons into separate lines
+    final_lines = []
+    for ln in merged:
+        parts = [p.strip() for p in ln.split(";") if p.strip()]
+        if parts:
+            final_lines.extend(parts)
+
+    # collapse multiple spaces
+    final_lines = [re.sub(r"\s+", " ", ln) for ln in final_lines]
+    return "\n".join(final_lines)
 
 
 # ---------- Rich text + auto-grow ----------
@@ -448,12 +594,212 @@ class CategoryRow(QWidget):
         return self.title.text().strip()
 
 
+class HeaderRow(QWidget):
+    requestDelete = Signal(object)
+    requestMoveUp = Signal(object)
+    requestMoveDown = Signal(object)
+    requestFocusToKey = Signal()
+
+    def __init__(self, title_text: str, icons: dict[str, QIcon], parent=None):
+        super().__init__(parent)
+        self.setProperty("class", "KVTable")
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        self.title = QLineEdit(title_text or "Neuer Abschnitt")
+        f = self.title.font(); f.setBold(True); self.title.setFont(f)
+        self.title.setAlignment(Qt.AlignVCenter | Qt.AlignHCenter)
+        self.title.setProperty("class", "SectionCell")
+        self.title.setFixedHeight(36)
+        self.title.returnPressed.connect(self._on_return_pressed)
+
+        actions = QWidget()
+        a_lay = QHBoxLayout(actions)
+        a_lay.setContentsMargins(6, 0, 0, 0)
+        a_lay.setSpacing(6)
+
+        self.btn_up = QToolButton();   self.btn_up.setIcon(icons.get("up", QIcon()))
+        self.btn_down = QToolButton(); self.btn_down.setIcon(icons.get("down", QIcon()))
+        self.btn_del = QToolButton();  self.btn_del.setIcon(icons.get("delete", QIcon()))
+        for b, tip in ((self.btn_up, "Nach oben"), (self.btn_down, "Nach unten"), (self.btn_del, "Eintrag löschen")):
+            b.setProperty("class", "rowAction"); b.setToolTip(tip)
+        self.btn_up.clicked.connect(lambda: self.requestMoveUp.emit(self))
+        self.btn_down.clicked.connect(lambda: self.requestMoveDown.emit(self))
+        self.btn_del.clicked.connect(lambda: self.requestDelete.emit(self))
+        a_lay.addWidget(self.btn_up); a_lay.addWidget(self.btn_down); a_lay.addWidget(self.btn_del)
+
+        lay.addWidget(self.title, 3)
+        lay.addSpacing(1)
+        lay.addWidget(actions, 0)
+
+    def _on_return_pressed(self):
+        self.title.clearFocus()
+        self.requestFocusToKey.emit()
+
+    def header_plain(self) -> str:
+        return self.title.text().strip()
+
+
+class ScrapeWorker(QThread):
+    finished = Signal(list)  # list of tuples: ("section", title) or ("kv", key, value_html)
+    error = Signal(str)
+    progress = Signal(int, int)  # current, total
+
+    def __init__(self, url: str, parent=None):
+        super().__init__(parent)
+        self.url = url
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def run(self):
+        driver = None
+        try:
+            _scrape_log(f"Start scrape: {self.url}")
+            def _build_chrome_options(headless_mode: str | None):
+                o = ChromeOptions()
+                if headless_mode:
+                    o.add_argument(f"--headless={headless_mode}")
+                o.add_argument("--disable-gpu")
+                o.add_argument("--no-sandbox")
+                o.add_argument("--disable-dev-shm-usage")
+                o.add_argument("--window-size=1280,800")
+                return o
+
+            def _build_edge_options(headless_mode: str | None):
+                o = EdgeOptions()
+                if headless_mode:
+                    o.add_argument(f"--headless={headless_mode}")
+                o.add_argument("--disable-gpu")
+                o.add_argument("--no-sandbox")
+                o.add_argument("--disable-dev-shm-usage")
+                o.add_argument("--window-size=1280,800")
+                return o
+
+            # Selenium Manager (bundled) resolves driver automatically.
+            try:
+                headless_mode = SCRAPE_HEADLESS_MODE if SCRAPE_HEADLESS else None
+                driver = webdriver.Chrome(options=_build_chrome_options(headless_mode))
+            except WebDriverException as e:
+                _scrape_log(f"Chrome start failed ({SCRAPE_HEADLESS_MODE}): {e}")
+                # Retry with alternate headless mode
+                if SCRAPE_HEADLESS:
+                    alt = "new" if SCRAPE_HEADLESS_MODE == "old" else "old"
+                    try:
+                        driver = webdriver.Chrome(options=_build_chrome_options(alt))
+                    except WebDriverException as e_alt:
+                        _scrape_log(f"Chrome start failed ({alt}): {e_alt}")
+                        e = e_alt
+
+                if not driver:
+                    # Fallback to Edge (also supported by Selenium Manager)
+                    try:
+                        headless_mode = SCRAPE_HEADLESS_MODE if SCRAPE_HEADLESS else None
+                        driver = webdriver.Edge(options=_build_edge_options(headless_mode))
+                    except WebDriverException as e2:
+                        _scrape_log(f"Edge start failed ({SCRAPE_HEADLESS_MODE}): {e2}")
+                        if SCRAPE_HEADLESS:
+                            alt = "new" if SCRAPE_HEADLESS_MODE == "old" else "old"
+                            try:
+                                driver = webdriver.Edge(options=_build_edge_options(alt))
+                            except WebDriverException as e3:
+                                _scrape_log(f"Edge start failed ({alt}): {e3}")
+                                self.error.emit(f"Chrome/Edge Treiberfehler:\n{e}\n\n{e3}")
+                                return
+                        else:
+                            self.error.emit(f"Chrome/Edge Treiberfehler:\n{e}\n\n{e2}")
+                            return
+
+            driver.get(self.url)
+            _scrape_log("Page loaded, waiting for .dkDataSheet")
+            WebDriverWait(driver, 20).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, ".dkDataSheet"))
+            )
+            _scrape_log(".dkDataSheet found")
+
+            if self._cancel:
+                self.finished.emit([])
+                return
+
+            soup = BeautifulSoup(driver.page_source, "html.parser")
+            sheet = soup.select_one(".dkDataSheet")
+            if not sheet:
+                _scrape_log("No .dkDataSheet in page source")
+                self.error.emit("Keine .dkDataSheet Tabelle gefunden.")
+                return
+
+            rows = []
+            skip_section = False
+            trs = sheet.select("tbody tr")
+            total = len(trs)
+            _scrape_log(f"Found {total} <tr> rows")
+            self.progress.emit(0, total)
+
+            for i, tr in enumerate(trs):
+                if self._cancel:
+                    self.finished.emit([])
+                    return
+
+                header_cell = tr.select_one('td.colLegende1[colspan="2"] h3')
+                if header_cell:
+                    title = _normalize_for_paste(header_cell.get_text(strip=True))
+                    if title:
+                        if title.lower() in SCRAPE_EXCLUDE_SECTIONS:
+                            skip_section = True
+                        else:
+                            skip_section = False
+                            rows.append(("section", title))
+                    continue
+
+                key_cell = tr.select_one("td.colLegende1")
+                val_cell = tr.select_one("td.colData1")
+                if key_cell and val_cell:
+                    if skip_section:
+                        continue
+                    key = _normalize_for_paste(key_cell.get_text(strip=True))
+                    if not key:
+                        continue
+                    if key.lower() in SCRAPE_EXCLUDE_KEYS:
+                        continue
+                    raw_val = val_cell.get_text("\n", strip=True)
+                    clean_val = _clean_scraped_value(raw_val)
+                    if clean_val:
+                        if key.lower() == "besonderheiten und sonstiges":
+                            items = [ln.strip() for ln in clean_val.splitlines() if ln.strip()]
+                            li_html = "".join(f"<li>{_escape_html(it)}</li>" for it in items)
+                            value_html = f"<ul>{li_html}</ul>"
+                        else:
+                            value_html = _escape_html(clean_val).replace("\n", "<br />")
+                        rows.append(("kv", key, value_html))
+
+                self.progress.emit(i + 1, total)
+
+            _scrape_log(f"Parsed {len(rows)} rows (sections + kv)")
+            self.finished.emit(rows)
+        except Exception as e:
+            _scrape_log(f"Scrape exception: {e}")
+            self.error.emit(str(e))
+        finally:
+            if driver:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+
+
 # ---------- Main window ----------
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_TITLE)
         self.setWindowIcon(QIcon(resource_path("icons\\icon_gra.ico")))
+
+        # Start auto-update check in background (silent)
+        self._start_update_check()
         self.resize(1120, 860)
         try_set_modern_app_font()
         apply_brand_theme(QApplication.instance())
@@ -528,17 +874,28 @@ class MainWindow(QMainWindow):
         fmt_grid.addWidget(tb_color, 1, 0)
         fmt_grid.addWidget(tb_list, 1, 1)
 
-        # --- Bottom row: add-category button (spans both columns) ---
-        self.btn_add_cat = QPushButton("Kategoriezeile\neinfügen")
-        self.btn_add_cat.setObjectName("accentSmall")
-        self.btn_add_cat.setToolTip("Abschnitts-Überschrift in die Liste einfügen")
-        self.btn_add_cat.clicked.connect(self.add_category_row)  # expects you implemented add_category_row()
+        # --- Section button ---
+        self.btn_section = QPushButton("Abschnitt")
+        self.btn_section.setObjectName("accentSmall")
+        self.btn_section.setToolTip("Abschnitts-Überschrift eingeben")
+        self.btn_section.setCheckable(True)
+        self.btn_section.toggled.connect(self._on_section_toggled)
 
         # open button
         open_button = QPushButton("Öffnen...")
         open_button.setObjectName("primaryButton")
         open_button.setShortcut(QKeySequence.Open)
         open_button.clicked.connect(self.load_from_file)
+
+        # online search button
+        self.btn_online = QPushButton("Online suchen")
+        self.btn_online.setObjectName("primaryButton")
+        self.btn_online.clicked.connect(self._on_online_search)
+
+        # clear button
+        self.btn_clear = QPushButton("Alles löschen")
+        self.btn_clear.setObjectName("primaryButton")
+        self.btn_clear.clicked.connect(self._on_clear_all)
 
         # center the grid horizontally in the frame
         center_row = QHBoxLayout()
@@ -610,8 +967,10 @@ class MainWindow(QMainWindow):
         lh_layout.setContentsMargins(0, 0, 0, 0)
         lh_layout.setSpacing(12)
         lh_layout.addWidget(open_button)
+        lh_layout.addWidget(self.btn_online)
+        lh_layout.addWidget(self.btn_clear)
         lh_layout.addWidget(format_panel, 0)
-        lh_layout.addWidget(self.btn_add_cat)
+        lh_layout.addWidget(self.btn_section)
         lh_layout.addWidget(robot_panel, 1, Qt.AlignBottom)
         block.addWidget(left_holder, 0)
 
@@ -664,7 +1023,7 @@ class MainWindow(QMainWindow):
         table_grid.addWidget(vline(), 0, 3)
         table_grid.addWidget(hdr_actions, 0, 4, Qt.AlignVCenter)
 
-        # Row 1: inputs
+        # Row 1: inputs (toggle between key/value vs section header)
         self.key_in = PlainPasteLineEdit()
         self.key_in.setPlaceholderText("Schlüssel Eingeben")
         _f = self.key_in.font()
@@ -673,42 +1032,62 @@ class MainWindow(QMainWindow):
         self.key_in.setAlignment(Qt.AlignVCenter | Qt.AlignRight)
         self.val_in = PlainPasteTextEdit(min_lines=3, max_lines=12)
         self.val_in.setPlaceholderText("Wert Eingeben (Ctrl+Enter bestätigt)")
+        self.header_in = PlainPasteLineEdit()
+        self.header_in.setPlaceholderText("Abschnittstitel eingeben")
+        hf = self.header_in.font(); hf.setBold(True); self.header_in.setFont(hf)
+        self.header_in.setAlignment(Qt.AlignVCenter | Qt.AlignHCenter)
+        self.header_in.setProperty("class", "SectionCell")
+        self.header_in.hide()
+
         self.confirm_btn = QPushButton("Bestätigen");
         self.confirm_btn.setObjectName("primaryButton")
         self.confirm_btn.clicked.connect(self.confirm_current_input)
         self.key_in.returnPressed.connect(self.confirm_current_input)
         self.val_in.confirm.connect(self.confirm_current_input)
+        self.header_in.returnPressed.connect(self.confirm_current_input)
         self.val_in.heightChanged.connect(lambda h: self.key_in.setFixedHeight(h))
         self.key_in.setFixedHeight(self.val_in.height())
 
+        self.vline_inputs_mid = vline()
+        self.vline_inputs_right = vline()
         table_grid.addWidget(self.key_in, 1, 0)
-        table_grid.addWidget(vline(), 1, 1)
+        table_grid.addWidget(self.vline_inputs_mid, 1, 1)
         table_grid.addWidget(self.val_in, 1, 2)
-        table_grid.addWidget(vline(), 1, 3)
+        table_grid.addWidget(self.header_in, 1, 0, 1, 3)
+        table_grid.addWidget(self.vline_inputs_right, 1, 3)
         table_grid.addWidget(self.confirm_btn, 1, 4, Qt.AlignVCenter)
 
-        # Row 2: paste buttons
+        # Row 2: paste buttons (toggle)
         self.btn_paste_key = QPushButton("Schlüssel einfügen (Zwischenablage)")
         self.btn_paste_val = QPushButton("Wert einfügen (Zwischenablage)")
-        for b in (self.btn_paste_key, self.btn_paste_val):
+        self.btn_paste_section = QPushButton("Abschnitt einfügen (Zwischenablage)")
+        for b in (self.btn_paste_key, self.btn_paste_val, self.btn_paste_section):
             b.setObjectName("accentSmall")
             b.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.btn_paste_key.clicked.connect(self.paste_key_plain)
         self.btn_paste_val.clicked.connect(self.paste_value_plain)
+        self.btn_paste_section.clicked.connect(self.paste_section_plain)
+        self.btn_paste_section.hide()
 
         confirm_width = self.confirm_btn.sizeHint().width()
         confirm_spacer = QSpacerItem(confirm_width, 0, QSizePolicy.Fixed, QSizePolicy.Fixed)
 
+        self.vline_paste_mid = vline()
+        self.vline_paste_right = vline()
         table_grid.addWidget(self.btn_paste_key, 2, 0, Qt.AlignTop)
-        table_grid.addWidget(vline(), 2, 1)
+        table_grid.addWidget(self.vline_paste_mid, 2, 1)
         table_grid.addWidget(self.btn_paste_val, 2, 2, Qt.AlignTop)
-        table_grid.addWidget(vline(), 2, 3)
+        table_grid.addWidget(self.btn_paste_section, 2, 0, 1, 3, Qt.AlignTop)
+        table_grid.addWidget(self.vline_paste_right, 2, 3)
         table_grid.addItem(confirm_spacer, 2, 4, Qt.AlignTop)
 
-        paste_h = max(self.btn_paste_key.sizeHint().height(), self.btn_paste_val.sizeHint().height())
+        paste_h = max(self.btn_paste_key.sizeHint().height(), self.btn_paste_val.sizeHint().height(),
+                      self.btn_paste_section.sizeHint().height())
         table_grid.setRowMinimumHeight(2, paste_h)
         table_grid.setRowStretch(2, 0)
         shell.addWidget(table)
+
+        self.input_mode = "kv"
 
         # Rows area (scrolls when necessary) — wrapper with bottom stretch
         rows_frame = QWidget()
@@ -754,6 +1133,34 @@ class MainWindow(QMainWindow):
 
         self.statusBar().showMessage("Bereit")
 
+    # ---------- Auto-Update Methods ----------
+    def _start_update_check(self):
+        """Start silent background update check."""
+        if not AUTO_UPDATE_AVAILABLE:
+            return
+        # Use QTimer to delay check slightly after window shows
+        QTimer.singleShot(2000, self._do_update_check)
+
+    def _do_update_check(self):
+        """Perform the actual update check."""
+        if not AUTO_UPDATE_AVAILABLE:
+            return
+        try:
+            auto_update.check_for_updates_silent(parent=self)
+        except Exception:
+            # Silent failure - don't interrupt user
+            pass
+
+    @Slot(object)
+    def _show_update_dialog_slot(self, version_info):
+        """Slot to show update dialog on main thread."""
+        if not AUTO_UPDATE_AVAILABLE:
+            return
+        try:
+            auto_update.show_update_dialog(version_info, parent=self)
+        except Exception:
+            pass
+
     def add_category_row(self):
         row = CategoryRow("Neuer Abschnitt", self.icons)
         row.requestDelete.connect(self._row_delete)
@@ -771,6 +1178,178 @@ class MainWindow(QMainWindow):
         self._scroll_row_bottom_into_view(row)
 
         QTimer.singleShot(0, row.title.setFocus)
+
+    def _on_online_search(self):
+        url, ok = QInputDialog.getText(
+            self, "Online suchen", "Link zu digitalkamera.de Spezifikationen:"
+        )
+        if not ok:
+            return
+        url = (url or "").strip()
+        if not url:
+            return
+        if "https://www.digitalkamera.de" not in url:
+            QMessageBox.warning(
+                self, "Ungültige URL",
+                "Bitte eine URL von https://www.digitalkamera.de eingeben."
+            )
+            return
+
+        self._start_scrape(url)
+
+    def _start_scrape(self, url: str):
+        if getattr(self, "_scrape_worker", None):
+            return
+
+        self.btn_online.setEnabled(False)
+        self._scrape_canceled = False
+        self._scrape_progress = QProgressDialog(
+            "Spezifikationen werden geladen…", "Abbrechen", 0, 0, self
+        )
+        self._scrape_progress.setWindowModality(Qt.WindowModal)
+        self._scrape_progress.setMinimumDuration(0)
+        self._scrape_progress.setAutoClose(True)
+        self._scrape_progress.setAutoReset(True)
+        self._scrape_progress.setValue(0)
+        self._scrape_progress.show()
+
+        self._scrape_worker = ScrapeWorker(url, self)
+        self._scrape_worker.finished.connect(self._scrape_finished)
+        self._scrape_worker.error.connect(self._scrape_error)
+        self._scrape_worker.progress.connect(self._scrape_progress_update)
+        self._scrape_progress.canceled.connect(self._scrape_cancel)
+        self._scrape_worker.start()
+
+    def _scrape_cancel(self):
+        w = getattr(self, "_scrape_worker", None)
+        if w:
+            self._scrape_canceled = True
+            _scrape_log("UI: cancel requested by user")
+            w.cancel()
+
+    def _scrape_finished(self, rows: list):
+        try:
+            print(f"[SCRAPE] finished signal, rows={len(rows) if rows else 0}")
+            _scrape_log(f"UI: finished signal, rows={len(rows) if rows else 0}")
+
+            if getattr(self, "_scrape_progress", None):
+                print("[SCRAPE] closing progress dialog")
+                _scrape_log("UI: closing progress dialog")
+                self._scrape_progress.close()
+
+            print("[SCRAPE] enabling button, clearing worker")
+            _scrape_log("UI: enabling button, clearing worker")
+            self.btn_online.setEnabled(True)
+            self._scrape_worker = None
+
+            if getattr(self, "_scrape_canceled", False) and not rows:
+                print("[SCRAPE] canceled with no rows -> return")
+                _scrape_log("UI: canceled with no rows -> return")
+                return
+
+            if not rows:
+                _scrape_log("No rows parsed, showing empty dialog")
+                print("[SCRAPE] no rows parsed -> showing dialog")
+                QMessageBox.information(self, "Keine Daten", "Keine Spezifikationen gefunden.")
+                return
+
+            _scrape_log(f"Populate UI with {len(rows)} rows")
+            print(f"[SCRAPE] populating UI with {len(rows)} rows")
+
+            for idx, item in enumerate(rows):
+                if not item:
+                    print(f"[SCRAPE] skip empty item at {idx}")
+                    continue
+                if item[0] == "section":
+                    print(f"[SCRAPE] add section at {idx}: {item[1][:60]}")
+                    row = HeaderRow(item[1], self.icons)
+                else:
+                    print(f"[SCRAPE] add kv at {idx}: {item[1][:60]}")
+                    row = EntryRow(item[1], item[2], self.icons)
+
+                row.requestDelete.connect(self._row_delete)
+                row.requestMoveUp.connect(self._row_move_up)
+                row.requestMoveDown.connect(self._row_move_down)
+                if hasattr(row, "requestFocusToKey"):
+                    row.requestFocusToKey.connect(lambda: self.key_in.setFocus(Qt.OtherFocusReason))
+
+                self.rows_widgets.append(row)
+                self.rows_v.addWidget(row)
+
+            print("[SCRAPE] populate complete, scrolling into view")
+            _scrape_log("UI: populate complete, scrolling into view")
+            self._scroll_row_bottom_into_view(self.rows_widgets[-1] if self.rows_widgets else None)
+        except Exception as e:
+            _scrape_log(f"UI populate exception: {e}")
+            print(f"[SCRAPE] UI populate exception: {e}")
+            QMessageBox.critical(self, "Scraping fehlgeschlagen", str(e))
+            return
+
+    def _scrape_error(self, msg: str):
+        if getattr(self, "_scrape_progress", None):
+            self._scrape_progress.close()
+        self.btn_online.setEnabled(True)
+        self._scrape_worker = None
+        QMessageBox.critical(self, "Scraping fehlgeschlagen", msg)
+
+    def _scrape_progress_update(self, current: int, total: int):
+        if not getattr(self, "_scrape_progress", None):
+            return
+        if total > 0:
+            if self._scrape_progress.maximum() != total:
+                self._scrape_progress.setRange(0, total)
+            self._scrape_progress.setValue(current)
+            self._scrape_progress.setLabelText(
+                f"Spezifikationen werden geladen… {current}/{total}"
+            )
+
+    def _on_clear_all(self):
+        res = QMessageBox.question(
+            self,
+            "Alles löschen",
+            "Alle Einträge und Überschriften löschen?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        if res != QMessageBox.Yes:
+            return
+
+        self.rows_widgets.clear()
+        while self.rows_v.count():
+            item = self.rows_v.takeAt(0)
+            w = item.widget()
+            if w:
+                w.setParent(None)
+                w.deleteLater()
+
+        self.key_in.clear()
+        self.val_in.clear()
+        self.header_in.clear()
+        self.btn_section.setChecked(False)
+        self._set_input_mode("kv")
+        self.key_in.setFocus()
+
+    def _on_section_toggled(self, checked: bool):
+        self._set_input_mode("section" if checked else "kv")
+
+    def _set_input_mode(self, mode: str):
+        if mode == self.input_mode:
+            return
+        self.input_mode = mode
+        is_section = mode == "section"
+        self.key_in.setVisible(not is_section)
+        self.val_in.setVisible(not is_section)
+        self.vline_inputs_mid.setVisible(not is_section)
+        self.header_in.setVisible(is_section)
+        self.btn_paste_key.setVisible(not is_section)
+        self.btn_paste_val.setVisible(not is_section)
+        self.vline_paste_mid.setVisible(not is_section)
+        self.btn_paste_section.setVisible(is_section)
+        if is_section:
+            self.header_in.setFocus(Qt.OtherFocusReason)
+            self.header_in.selectAll()
+        else:
+            self.key_in.setFocus(Qt.OtherFocusReason)
 
     # Place a QToolBar inside a QWidget so layouts ca
     # n size it vertically
@@ -835,6 +1414,13 @@ class MainWindow(QMainWindow):
         self.val_in.setTextCursor(c)
         self.val_in.insertPlainText(txt)  # QTextEdit: plain text insert
 
+    def paste_section_plain(self):
+        txt = self._clipboard_plain_trimmed()
+        if not txt:
+            return
+        self.header_in.setFocus(Qt.OtherFocusReason)
+        self.header_in.insert(txt)
+
     def _scroll_row_bottom_into_view(self, row: QWidget | None, extra_px: int = 24):
         """
         Scroll so the *bottom* of `row` is visible, with a small margin.
@@ -858,6 +1444,29 @@ class MainWindow(QMainWindow):
 
     # Add a persistent row
     def confirm_current_input(self):
+        if self.input_mode == "section":
+            title = self.header_in.text().strip()
+            if not title:
+                QMessageBox.information(self, "Fehlender Abschnitt", "Bitte Abschnittstitel eingeben.")
+                return
+
+            row = HeaderRow(title, self.icons)
+            row.requestDelete.connect(self._row_delete)
+            row.requestMoveUp.connect(self._row_move_up)
+            row.requestMoveDown.connect(self._row_move_down)
+            row.requestFocusToKey.connect(lambda: self.key_in.setFocus(Qt.OtherFocusReason))
+
+            self.rows_widgets.append(row)
+            self.rows_v.addWidget(row)
+
+            self._scroll_row_bottom_into_view(row)
+
+            self.header_in.clear()
+            self.btn_section.setChecked(False)
+            self._set_input_mode("kv")
+            self.key_in.setFocus()
+            return
+
         key = self.key_in.text().strip()
         if not key:
             QMessageBox.information(self, "Fehlender Schlüssel", "Bitte Schlüssel eingeben.")
@@ -933,6 +1542,15 @@ class MainWindow(QMainWindow):
         lines.append("\t<tbody>")
 
         for rw in self.rows_widgets:
+            # Section/header row?
+            is_section = hasattr(rw, "header_plain")
+            if is_section:
+                title = _escape_html(rw.header_plain())
+                lines.append('\t\t<tr class="section">')
+                lines.append(f'\t\t\t<th class="section" colspan="2">{title}</th>')
+                lines.append('\t\t</tr>')
+                continue
+
             # Category row?
             is_category = hasattr(rw, "title_plain") and not hasattr(rw, "key_plain")
             if is_category:
@@ -954,14 +1572,17 @@ class MainWindow(QMainWindow):
         lines.append("</table>")
 
         out = "\n".join(lines)
+        out = _normalize_for_paste(out)
 
         # --- Save dialog ---
         base = self.title_in.text().strip() or DEFAULT_EXPORT_TITLE
         base = "".join(ch if ch.isalnum() or ch in (" ", "-", "_") else "_" for ch in base).strip()
         base = "_".join(base.split()) or DEFAULT_EXPORT_TITLE
         default_name = f"{base}.txt"
+        desktop = QStandardPaths.writableLocation(QStandardPaths.DesktopLocation) or ""
+        default_path = os.path.join(desktop, default_name) if desktop else default_name
         path, _ = QFileDialog.getSaveFileName(
-            self, "Speichern (einfügefertiges HTML)", default_name,
+            self, "Speichern (einfügefertiges HTML)", default_path,
             "Text/HTML (*.txt *.html *.htm);;All Files (*.*)"
         )
         if not path:
@@ -993,7 +1614,9 @@ class MainWindow(QMainWindow):
                 rows = []
                 if ver >= 2:
                     for r in rows_meta:
-                        if r.get("type") == "cat":
+                        if r.get("type") == "section":
+                            rows.append(("__SECTION__", r.get("title", "")))
+                        elif r.get("type") == "cat":
                             rows.append(("__CAT__", r.get("title", "")))
                         else:
                             rows.append((r.get("key", ""), r.get("value_html", "")))
@@ -1023,6 +1646,16 @@ class MainWindow(QMainWindow):
             # iterate <tr> in order and decide per row
             for mtr in re.finditer(r'<tr[^>]*>(.*?)</tr>', tbody, re.DOTALL | re.IGNORECASE):
                 tr_html = mtr.group(0)
+
+                # section/header row?
+                if re.search(r'class="[^"]*\bsection\b[^"]*"', tr_html, re.IGNORECASE):
+                    mtitle = re.search(
+                        r'<th[^>]*class="[^"]*\bsection\b[^"]*"[^>]*colspan="2"[^>]*>(.*?)</th>',
+                        tr_html, re.DOTALL | re.IGNORECASE
+                    )
+                    title = _html.unescape(mtitle.group(1).strip()) if mtitle else ""
+                    rows.append(("__SECTION__", title))
+                    continue
 
                 # category row?
                 if re.search(r'class="[^"]*\bcat\b[^"]*"', tr_html, re.IGNORECASE):
@@ -1078,13 +1711,17 @@ class MainWindow(QMainWindow):
 
         # Re-add rows + tail spacer so rows pin to top
         for key_plain, value_html in rows:
-            if key_plain == "__CAT__":
+            if key_plain == "__SECTION__":
+                row = HeaderRow(value_html, self.icons)
+            elif key_plain == "__CAT__":
                 row = CategoryRow(value_html, self.icons)  # value_html holds the title here
             else:
                 row = EntryRow(key_plain, value_html, self.icons)
             row.requestDelete.connect(self._row_delete)
             row.requestMoveUp.connect(self._row_move_up)
             row.requestMoveDown.connect(self._row_move_down)
+            if hasattr(row, "requestFocusToKey"):
+                row.requestFocusToKey.connect(lambda: self.key_in.setFocus(Qt.OtherFocusReason))
             self.rows_widgets.append(row)
             self.rows_v.addWidget(row)
 

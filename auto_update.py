@@ -21,7 +21,7 @@ except ImportError:
 # -----------------------------------------------------------------------------
 # Configuration
 # -----------------------------------------------------------------------------
-CURRENT_VERSION = "1.0.1"
+CURRENT_VERSION = "2.0.0"
 APP_NAME = "SpecHTMLGenerator"
 UPDATE_SERVER = f"https://downloads.graphicart.ch/{APP_NAME}"
 VERSION_JSON_URL = f"{UPDATE_SERVER}/version.json"

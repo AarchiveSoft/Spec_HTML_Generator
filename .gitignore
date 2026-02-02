@@ -80,3 +80,29 @@ fabric.properties
 /main_bak.py
 /output/
 !/output/Claudias Listenwichtel.exe
+
+# PyInstaller
+/build/
+/dist/
+*.spec.bak
+
+# Installer output
+/installer_output/
+!installer_output/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Byte-compiled / optimized / DLL files
+*.pyc
+/QUICKSTART_RELEASE.md
+/Release_Process.md
+/SETUP_COMPLETE.md
+/test_resources.py
+/.venv/
+/.venv/*
+/.idea/
+/.claude/
