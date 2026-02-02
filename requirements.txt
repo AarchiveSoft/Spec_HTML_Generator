@@ -1,0 +1,16 @@
+# Claudias Spezifikationen Assistent - Dependencies
+# Install: pip install -r requirements.txt
+
+# GUI Framework
+PySide6>=6.5.0
+
+# Auto-Update Dependencies
+requests>=2.28.0
+packaging>=21.0
+
+# Web scraping
+selenium>=4.20.0
+beautifulsoup4>=4.12.0
+
+# Build Tools (development)
+pyinstaller>=6.0.0
