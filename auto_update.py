@@ -10,6 +10,7 @@ import tempfile
 import subprocess
 import threading
 from packaging import version
+from datetime import datetime
 
 # Try requests import - graceful fallback if not available
 try:
@@ -22,13 +23,23 @@ except ImportError:
 # Configuration
 # -----------------------------------------------------------------------------
 CURRENT_VERSION = "2.0.0"
-APP_NAME = "SpecHTMLGenerator"
-UPDATE_SERVER = f"https://downloads.graphicart.ch/{APP_NAME}"
+UPDATE_SERVER = "https://downloads.graphicart.ch/ListenWichtel"
 VERSION_JSON_URL = f"{UPDATE_SERVER}/version.json"
 
 # HTTP Basic Auth credentials
 AUTH_USER = "autoupdate"
-AUTH_PASS = f"{APP_NAME}_au70upd473_2025_secure"
+AUTH_PASS = "GA_au70upd473_2025_secure"
+
+def _log(msg: str):
+    try:
+        base = os.path.abspath(".")
+        out_dir = os.path.join(base, "output")
+        os.makedirs(out_dir, exist_ok=True)
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(os.path.join(out_dir, "update.log"), "a", encoding="utf-8") as f:
+            f.write(f"[{ts}] {msg}\n")
+    except Exception:
+        pass
 
 
 def resource_path(relative_path):
@@ -48,6 +59,7 @@ def fetch_version_info():
     Returns dict with version info or None on failure.
     """
     if not REQUESTS_AVAILABLE:
+        _log("requests not available; update check skipped")
         return None
 
     try:
@@ -57,9 +69,12 @@ def fetch_version_info():
             timeout=10
         )
         response.raise_for_status()
-        return response.json()
-    except Exception:
+        data = response.json()
+        _log(f"version.json fetched OK; version={data.get('version')}")
+        return data
+    except Exception as e:
         # Silent failure - don't interrupt user
+        _log(f"fetch_version_info failed: {e}")
         return None
 
 
@@ -320,9 +335,11 @@ def check_for_updates_silent(parent=None, callback=None):
         callback: Optional callback(has_update: bool) when check complete
     """
     def check_thread():
+        _log("silent update check started")
         version_info = fetch_version_info()
 
         if version_info and is_update_available(version_info.get('version', '')):
+            _log(f"update available: {version_info.get('version')}")
             # Update available - show dialog on main thread
             if parent:
                 try:
@@ -339,6 +356,7 @@ def check_for_updates_silent(parent=None, callback=None):
             if callback:
                 callback(True)
         else:
+            _log("no update available")
             if callback:
                 callback(False)
 

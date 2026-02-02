@@ -2,6 +2,7 @@
 # Requirements: Python 3.9+  ->  pip install PySide6 requests packaging
 
 import sys, os
+import threading
 import re
 import json
 import html as _html
@@ -793,6 +794,7 @@ class ScrapeWorker(QThread):
 
 # ---------- Main window ----------
 class MainWindow(QMainWindow):
+    updateFound = Signal(object)
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_TITLE)
@@ -1131,6 +1133,7 @@ class MainWindow(QMainWindow):
         block.addLayout(shell, 1)
         outer.addLayout(block)
 
+        self.updateFound.connect(self._show_update_dialog_slot)
         self.statusBar().showMessage("Bereit")
 
     # ---------- Auto-Update Methods ----------
@@ -1145,11 +1148,14 @@ class MainWindow(QMainWindow):
         """Perform the actual update check."""
         if not AUTO_UPDATE_AVAILABLE:
             return
-        try:
-            auto_update.check_for_updates_silent(parent=self)
-        except Exception:
-            # Silent failure - don't interrupt user
-            pass
+        def _worker():
+            try:
+                has_update, info = auto_update.check_for_updates_blocking()
+                if has_update and info:
+                    self.updateFound.emit(info)
+            except Exception:
+                pass
+        threading.Thread(target=_worker, daemon=True).start()
 
     @Slot(object)
     def _show_update_dialog_slot(self, version_info):
