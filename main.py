@@ -7,16 +7,16 @@ import re
 import json
 import html as _html
 from datetime import datetime
-from PySide6.QtCore import Qt, QSize, QTimer, Signal, QPoint, Slot, QThread, QStandardPaths
+from PySide6.QtCore import Qt, QSize, QTimer, Signal, QPoint, Slot, QThread, QStandardPaths, QUrl
 from PySide6.QtGui import (
     QAction, QKeySequence, QTextCharFormat, QTextCursor, QTextListFormat,
-    QFont, QColor, QGuiApplication, QFontDatabase, QClipboard, QPalette, QIcon, QPixmap
+    QFont, QColor, QGuiApplication, QFontDatabase, QClipboard, QPalette, QIcon, QPixmap, QDesktopServices
 )
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QToolBar, QVBoxLayout, QHBoxLayout,
     QLabel, QTextEdit, QLineEdit, QPushButton, QFileDialog, QMessageBox,
     QColorDialog, QCheckBox, QFrame, QSizePolicy, QScrollArea, QGridLayout,
-    QToolButton, QSpacerItem, QInputDialog, QProgressDialog
+    QToolButton, QSpacerItem, QProgressDialog, QDialog, QDialogButtonBox
 )
 
 # Web scraping deps (optional until used)
@@ -262,6 +262,174 @@ def _escape_html(text: str) -> str:
 def _normalize_for_paste(t: str) -> str:
     # Map ß/ẞ → ss/SS (idempotent)
     return (t or "").replace("ß", "ss").replace("ẞ", "SS")
+
+def _load_fr_translations():
+    # Optional external mapping file: {"Deutsch": "Francais", ...}
+    candidates = [
+        resource_path("translations_fr.json"),
+        os.path.join(os.path.abspath("."), "translations_fr.json"),
+    ]
+    path = next((p for p in candidates if p and os.path.exists(p)), None)
+    if not path:
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return {str(k): str(v) for k, v in (data or {}).items() if str(k)}
+    except Exception:
+        return {}
+
+_FR_TRANSLATIONS = {
+    # Core headers
+    "Kategorie": "Catégorie",
+    "Details": "Détails",
+    # Common yes/no
+    "ja": "oui",
+    "nein": "non",
+    "kein": "aucun",
+    "keine": "aucune",
+    # Common section/label terms (expand via translations_fr.json as needed)
+    "Modell": "Modèle",
+    "Markteinführung": "Lancement sur le marché",
+    "Nachfolgermodell": "Modèle successeur",
+    "Kameraklasse(n)": "Classe(s) d’appareil",
+    "Elektronik": "Électronique",
+    "Sensor": "Capteur",
+    "Pixelpitch": "Pas de pixel",
+    "Fotoauflösung": "Résolution photo",
+    "Bildformate": "Formats d’image",
+    "Farbtiefe": "Profondeur de couleur",
+    "Metadaten": "Métadonnées",
+    "Videoauflösung": "Résolution vidéo",
+    "HDR-Video": "Vidéo HDR",
+    "Videoformat": "Format vidéo",
+    "All-Intra-Aufzeichnung": "Enregistrement All-Intra",
+    "Audioformat (Video)": "Format audio (vidéo)",
+    "Objektiv": "Objectif",
+    "Objektivanschluss": "Monture d’objectif",
+    "Fokussierung": "Mise au point",
+    "Autofokusart": "Type d’autofocus",
+    "AF-Erkennungsfunktion": "Fonction de détection AF",
+    "Schärfenkontrolle": "Contrôle de la netteté",
+    "Sucher und Monitor": "Viseur et écran",
+    "Monitor": "Écran",
+    "Videosucher": "Viseur électronique",
+    "Belichtung": "Exposition",
+    "Belichtungsmessung": "Mesure de l’exposition",
+    "Belichtungszeiten": "Vitesses d’obturation",
+    "Belichtungssteuerung": "Commande d’exposition",
+    "Belichtungsreihenfunktion": "Fonction de bracketing d’exposition",
+    "Belichtungskorrektur": "Correction d’exposition",
+    "Lichtempfindlichkeit": "Sensibilité",
+    "Fernzugriff": "Accès à distance",
+    "Weissabgleich": "Balance des blancs",
+    "Farbraum": "Espace colorimétrique",
+    "Serienaufnahmen": "Prises de vue en rafale",
+    "Selbstauslöser": "Retardateur",
+    "Timer": "Minuterie",
+    "Aufnahmefunktionen": "Fonctions de prise de vue",
+    "Blitzgerät": "Flash",
+    "Blitz": "Flash",
+    "Blitzreichweite": "Portée du flash",
+    "Blitzfunktionen": "Fonctions flash",
+    "Ausstattung": "Équipement",
+    "Bildstabilisator": "Stabilisateur d’image",
+    "Speicher": "Mémoire",
+    "Zweiter Speicherkartensteckplatz": "Deuxième emplacement pour carte mémoire",
+    "Zweiter Speicherkartenslot": "Deuxième emplacement pour carte mémoire",
+    "zweiter Speicherkartenslot": "Deuxième emplacement pour carte mémoire",
+    "GPS-Funktion": "Fonction GPS",
+    "Mikrofon": "Microphone",
+    "Netzteil": "Bloc d’alimentation",
+    "Netztteil": "Bloc d’alimentation",
+    "Stromversorgung": "Alimentation",
+    "Wiedergabefunktionen": "Fonctions de lecture",
+    "Wiedergabe-Funktionen": "Fonctions de lecture",
+    "Bildeinstellungen": "Paramètres d’image",
+    "Bildparameter": "Paramètres d’image",
+    "Spezialfunktionen": "Fonctions spéciales",
+    "Sonder-Funktionen": "Fonctions spéciales",
+    "USB-Typ": "Type USB",
+    "Drahtlos": "Sans fil",
+    "Datenschnittstelle": "Interface de données",
+    "Daten-Schnittstelle": "Interface de données",
+    "AV-Anschlüsse": "Connectiques AV",
+    "HDMI-Output": "HDMI propre",
+    "HDMI-Output-Auflösungen": "Résolutions HDMI propre",
+    "HDMI-Output-Farbraum": "Espace colorimétrique HDMI propre",
+    "HDMI-Output-Bemerkungen": "Remarques HDMI propre",
+    "Clean HDMI": "Clean HDMI",
+    "Clean HDMI Auflösungen": "Résolutions HDMI propre",
+    "Clean HDMI Farbraum": "Espace colorimétrique HDMI propre",
+    "Clean HDMI Anmerkungen": "Remarques HDMI propre",
+    "Webcam-Funktion": "Fonction webcam",
+    "Direktdruckunterstützung": "Procédés d’impression directe pris en charge",
+    "Unterstützte Direkt-Druck-Verfahren": "Procédés d’impression directe pris en charge",
+    "Stativgewinde": "Filetage pour trépied",
+    "Gehäuse": "Boîtier",
+    "Besonderheiten und Sonstiges": "Particularités et divers",
+    "Abmessungen und Gewicht": "Dimensions et poids",
+    "Grösse und Gewicht": "Dimensions et poids",
+    "Abmessungen B x H x T": "Dimensions L x H x P",
+    "Gewicht": "Poids",
+    "Sonstiges": "Divers",
+    "Mitgeliefertes Zubehör": "Accessoires fournis",
+    "mitgeliefertes Zubehör": "Accessoires fournis",
+    "Timecode": "Timecode",
+}
+
+def _translate_de_to_fr_html(html: str) -> str:
+    mapping = dict(_FR_TRANSLATIONS)
+    mapping.update(_load_fr_translations())
+    if not mapping:
+        return html
+
+    ordered = sorted(mapping.items(), key=lambda kv: len(kv[0]), reverse=True)
+    parts = re.split(r"(<[^>]+>)", html or "")
+    in_style = False
+
+    def _apply(text: str) -> str:
+        out = text
+        for src, dst in ordered:
+            if not src:
+                continue
+            if re.search(r"[A-Za-zÀ-ÿÄÖÜäöüß]", src):
+                pattern = r"(?<!\w)" + re.escape(src) + r"(?!\w)"
+                out = re.sub(pattern, dst, out)
+            else:
+                out = out.replace(src, dst)
+        return out
+
+    for i, part in enumerate(parts):
+        if not part or part.startswith("<"):
+            tag = (part or "").lower()
+            if tag.startswith("<style"):
+                in_style = True
+            elif tag.startswith("</style"):
+                in_style = False
+            continue
+        if in_style:
+            continue
+        parts[i] = _apply(part)
+
+    return "".join(parts)
+
+def _find_untranslated_labels(html: str, mapping: dict) -> list:
+    missing = []
+    if not html:
+        return missing
+    # Capture all header cells (keys/sections/categories)
+    for m in re.finditer(r"<th[^>]*>(.*?)</th>", html, re.DOTALL | re.IGNORECASE):
+        raw = m.group(1) or ""
+        text = re.sub(r"<[^>]+>", "", raw)
+        text = _html.unescape(text).strip()
+        if not text:
+            continue
+        if text in mapping:
+            continue
+        if text not in missing:
+            missing.append(text)
+    return missing
 
 def _sanitize_value_html(html: str) -> str:
     # remove only font-family/font-size and Qt-specific noise from inline styles
@@ -1186,12 +1354,71 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, row.title.setFocus)
 
     def _on_online_search(self):
-        url, ok = QInputDialog.getText(
-            self, "Online suchen", "Link zu digitalkamera.de Spezifikationen:"
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Online suchen")
+        dialog.setModal(True)
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+
+        title = QLabel("🡇   digitalkamera.de öffnen   🡇")
+        title.setStyleSheet("""
+            background-color: #006B8D;
+            color: #FFFFFF;
+            padding: 6px;
+            font-weight: bold;
+            border-radius: 10px;
+            box-shadow: 2px 2px 3px #FFFFFF;
+        """)
+        title.setAlignment(Qt.AlignHCenter)
+        layout.addWidget(title)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(10)
+        btn_cams = QPushButton("Kameras")
+        btn_cams.setStyleSheet("""
+            background-color: #006B8D;
+            color: #FFFFFF;
+            font-weight: bold;  
+            padding: 6px;
+        """)
+        btn_lenses = QPushButton("Objektive")
+        btn_lenses.setStyleSheet("""
+            background-color: #006B8D;
+            color: #FFFFFF;
+            font-weight: bold;  
+            padding: 6px;
+        """)
+        btn_row.addWidget(btn_cams)
+        btn_row.addWidget(btn_lenses)
+        layout.addLayout(btn_row)
+
+        def _open_digitalkamera(url: str):
+            QDesktopServices.openUrl(QUrl(url))
+
+        btn_cams.clicked.connect(
+            lambda: _open_digitalkamera("https://www.digitalkamera.de/Kamera/Schnellzugriff.aspx")
         )
-        if not ok:
+        btn_lenses.clicked.connect(
+            lambda: _open_digitalkamera("https://www.digitalkamera.de/Objektiv/Schnellzugriff.aspx")
+        )
+
+        input_label = QLabel("Link zu digitalkamera.de Datenblatt:")
+        url_in = QLineEdit()
+        url_in.setPlaceholderText("https://www.digitalkamera.de/...")
+        layout.addWidget(input_label)
+        layout.addWidget(url_in)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons, alignment=Qt.AlignCenter)
+
+        if dialog.exec() != QDialog.Accepted:
             return
-        url = (url or "").strip()
+
+        url = (url_in.text() or "").strip()
         if not url:
             return
         if "https://www.digitalkamera.de" not in url:
@@ -1579,6 +1806,10 @@ class MainWindow(QMainWindow):
 
         out = "\n".join(lines)
         out = _normalize_for_paste(out)
+        mapping = dict(_FR_TRANSLATIONS)
+        mapping.update(_load_fr_translations())
+        out_fr = _translate_de_to_fr_html(out)
+        missing_fr = _find_untranslated_labels(out, mapping)
 
         # --- Save dialog ---
         base = self.title_in.text().strip() or DEFAULT_EXPORT_TITLE
@@ -1593,10 +1824,27 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
+        out_dir = os.path.dirname(path) or "."
+        name = os.path.basename(path)
+        stem, ext = os.path.splitext(name)
+        if stem.endswith("_de") or stem.endswith("_fr"):
+            stem = stem[:-3]
+        if not ext:
+            ext = ".txt"
+        path_de = os.path.join(out_dir, f"{stem}_de{ext}")
+        path_fr = os.path.join(out_dir, f"{stem}_fr{ext}")
         try:
-            with open(path, "w", encoding="utf-8") as f:
+            with open(path_de, "w", encoding="utf-8") as f:
                 f.write(out)
-            self.statusBar().showMessage(f"Gespeichert unter: {path}", 4000)
+            with open(path_fr, "w", encoding="utf-8") as f:
+                f.write(out_fr)
+            self.statusBar().showMessage(
+                f"Gespeichert unter: {path_de} und {path_fr}", 5000
+            )
+            if missing_fr:
+                msg = "Nicht übersetzte Begriffe (bitte in translations_fr.json ergänzen):\n\n"
+                msg += "\n".join(missing_fr)
+                QMessageBox.information(self, "Fehlende Übersetzungen", msg)
         except Exception as e:
             QMessageBox.critical(self, "Speicherfehler", str(e))
 

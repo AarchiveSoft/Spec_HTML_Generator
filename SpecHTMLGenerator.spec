@@ -17,6 +17,7 @@ APP_NAME = 'SpecHTMLGenerator'
 datas = [
     ('icons', 'icons'),
     ('auto_update.py', '.'),
+    ('translations_fr.json', '.'),
 ]
 
 # Hidden imports
