@@ -10,13 +10,13 @@ from datetime import datetime
 from PySide6.QtCore import Qt, QSize, QTimer, Signal, QPoint, Slot, QThread, QStandardPaths, QUrl
 from PySide6.QtGui import (
     QAction, QKeySequence, QTextCharFormat, QTextCursor, QTextListFormat,
-    QFont, QColor, QGuiApplication, QFontDatabase, QClipboard, QPalette, QIcon, QPixmap, QDesktopServices
+    QFont, QColor, QGuiApplication, QFontDatabase, QClipboard, QPalette, QIcon, QPixmap, QDesktopServices, QMovie
 )
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QToolBar, QVBoxLayout, QHBoxLayout,
     QLabel, QTextEdit, QLineEdit, QPushButton, QFileDialog, QMessageBox,
     QColorDialog, QCheckBox, QFrame, QSizePolicy, QScrollArea, QGridLayout,
-    QToolButton, QSpacerItem, QProgressDialog, QDialog, QDialogButtonBox
+    QToolButton, QSpacerItem, QProgressDialog, QDialog, QDialogButtonBox, QLayout
 )
 
 # Web scraping deps (optional until used)
@@ -27,7 +27,27 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.edge.options import Options as EdgeOptions
 from selenium.common.exceptions import WebDriverException
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Comment
+
+# Translation deps (optional until used)
+try:
+    import argostranslate.package as argos_package
+    import argostranslate.translate as argos_translate
+    ARGOS_AVAILABLE = True
+except ImportError:
+    ARGOS_AVAILABLE = False
+
+try:
+    import fasttext
+    FASTTEXT_AVAILABLE = True
+except ImportError:
+    FASTTEXT_AVAILABLE = False
+
+try:
+    import langid
+    LANGID_AVAILABLE = True
+except ImportError:
+    LANGID_AVAILABLE = False
 
 # Import auto-update module (graceful fallback if not available)
 try:
@@ -66,6 +86,57 @@ SCRAPE_EXCLUDE_KEYS = {
 SCRAPE_EXCLUDE_SECTIONS = {
     "weiterführende links",
 }
+
+ARGOS_MODEL_DIR = "argos_models"
+ARGOS_LANG_FROM = "de"
+ARGOS_LANG_TO = "fr"
+LANG_DETECT_MIN_PROB = 0.3
+FASTTEXT_MODEL_DIR = "fasttext_models"
+FASTTEXT_LANG_MODEL = "lid.176.ftz"
+TRANSLATION_DEBUG = os.environ.get("SPEC_TRANSLATE_DEBUG") == "1"
+GERMAN_HINT_RE = re.compile(
+    r"(?:\b(und|oder|mit|für|ohne|nicht|kein|keine|einen|eine|der|die|das|von|bis|nach|über|unter|bei|auf|aus|mehr|weniger|zwischen|funktion|sucher|optisch|extern|betriebsbereit|farbkanal|synchronzeit|kleinbild|gesicht)\b|[äöüÄÖÜß])",
+    re.IGNORECASE
+)
+FR_POST_EDITS = {
+    "petite image": "plein format",
+    "crop facteur": "facteur de recadrage",
+}
+
+PROTECTED_TOKEN_PATTERNS = [
+    r"\b[A-Z0-9][A-Z0-9\-_/\.]{2,}\b",  # acronyms/model codes (USB, HDMI, NP-FZ100)
+    r"\bISO\s?\d+(?:[\-–]\d+)?\b",
+    r"\b\d+(?:[.,]\d+)?\s?(?:mm|cm|m|µm|nm|°|s|EV|W|Wh|mAh|GHz|MHz|K|Bit|bits|B/s|BpS|fps)\b",
+    r"\b\d+(?:[.,]\d+)?\s?[x×]\s?\d+(?:[.,]\d+)?\b",  # resolutions
+    r"\b\d+(?:[.,]\d+)?\s?(?:MBit/s|Mbit/s|Mb/s|Mbps|Gb/s|Gbps)\b",
+    r"\b(?:RAW|JPG|JPEG|HEIF|PNG|TIFF|DCF|EXIF)\b",
+    r"\b(?:Wi-Fi|WLAN|Bluetooth|NFC|USB|HDMI|LAN)\b",
+    r"\b(?:UHS\s?I|UHS\s?II|CFexpress|SDHC|SDXC|SD)\b",
+    r"\b(?:XAVC|H\.264|H\.265|HEVC|AVC)\b",
+    r"\b(?:NTSC|PAL)\b",
+]
+
+def _build_protected_regex():
+    return re.compile("|".join(f"(?:{p})" for p in PROTECTED_TOKEN_PATTERNS), re.IGNORECASE)
+
+_PROTECTED_RE = _build_protected_regex()
+
+def _mask_protected_tokens(text: str) -> tuple[str, list[str]]:
+    if not text:
+        return text, []
+    tokens = []
+    def _repl(m):
+        tokens.append(m.group(0))
+        return f"<<T{len(tokens)-1}>>"
+    return _PROTECTED_RE.sub(_repl, text), tokens
+
+def _unmask_protected_tokens(text: str, tokens: list[str]) -> str:
+    if not tokens:
+        return text
+    out = text
+    for i, tok in enumerate(tokens):
+        out = out.replace(f"<<T{i}>>", tok)
+    return out
 
 SPEC_TABLE_CSS = """
 <style type="text/css">
@@ -279,6 +350,17 @@ def _load_fr_translations():
     except Exception:
         return {}
 
+def _load_fr_post_edits():
+    path = resource_path("translations_fr_post.json")
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return {str(k): str(v) for k, v in (data or {}).items() if str(k)}
+    except Exception:
+        return {}
+
 _FR_TRANSLATIONS = {
     # Core headers
     "Kategorie": "Catégorie",
@@ -378,58 +460,364 @@ _FR_TRANSLATIONS = {
     "Timecode": "Timecode",
 }
 
-def _translate_de_to_fr_html(html: str) -> str:
-    mapping = dict(_FR_TRANSLATIONS)
-    mapping.update(_load_fr_translations())
-    if not mapping:
-        return html
+_ARGOS_READY = False
+_ARGOS_TRANSLATOR = None
+_ARGOS_CHAIN = None
+_FASTTEXT_MODEL = None
 
-    ordered = sorted(mapping.items(), key=lambda kv: len(kv[0]), reverse=True)
-    parts = re.split(r"(<[^>]+>)", html or "")
-    in_style = False
-
-    def _apply(text: str) -> str:
-        out = text
-        for src, dst in ordered:
-            if not src:
-                continue
-            if re.search(r"[A-Za-zÀ-ÿÄÖÜäöüß]", src):
-                pattern = r"(?<!\w)" + re.escape(src) + r"(?!\w)"
-                out = re.sub(pattern, dst, out)
-            else:
-                out = out.replace(src, dst)
-        return out
-
-    for i, part in enumerate(parts):
-        if not part or part.startswith("<"):
-            tag = (part or "").lower()
-            if tag.startswith("<style"):
-                in_style = True
-            elif tag.startswith("</style"):
-                in_style = False
+def _find_argos_model_file() -> str | None:
+    candidates = [
+        resource_path(ARGOS_MODEL_DIR),
+        os.path.join(os.path.abspath("."), ARGOS_MODEL_DIR),
+    ]
+    for base in candidates:
+        if not base or not os.path.isdir(base):
             continue
-        if in_style:
+        for name in os.listdir(base):
+            if name.lower().endswith(".argosmodel"):
+                return os.path.join(base, name)
+    return None
+
+def _ensure_argos_translator() -> bool:
+    global _ARGOS_READY, _ARGOS_TRANSLATOR
+    global _ARGOS_CHAIN
+    if _ARGOS_READY and (_ARGOS_TRANSLATOR or _ARGOS_CHAIN):
+        return True
+    if not ARGOS_AVAILABLE:
+        _tr_log("Argos not available (import failed).")
+        return False
+    try:
+        langs = argos_translate.get_installed_languages()
+        _tr_log(f"Argos installed langs: {[l.code for l in langs]}")
+        def _get_lang(code: str):
+            return next((l for l in langs if l.code == code), None)
+
+        def _refresh_langs():
+            nonlocal langs
+            langs = argos_translate.get_installed_languages()
+
+        # Try direct de->fr
+        src = _get_lang(ARGOS_LANG_FROM)
+        dst = _get_lang(ARGOS_LANG_TO)
+        if src and dst:
+            try:
+                _ARGOS_TRANSLATOR = src.get_translation(dst)
+                _ARGOS_CHAIN = None
+                _ARGOS_READY = True
+                return True
+            except Exception:
+                pass
+
+        # Install any bundled models (if not already installed)
+        model_path = _find_argos_model_file()
+        if model_path:
+            try:
+                _tr_log(f"Installing Argos model from {model_path}")
+                argos_package.install_from_path(model_path)
+                _refresh_langs()
+            except Exception:
+                pass
+
+        # Try direct again after install
+        src = _get_lang(ARGOS_LANG_FROM)
+        dst = _get_lang(ARGOS_LANG_TO)
+        if src and dst:
+            try:
+                _ARGOS_TRANSLATOR = src.get_translation(dst)
+                _ARGOS_CHAIN = None
+                _ARGOS_READY = True
+                return True
+            except Exception:
+                pass
+
+        # Fallback: pivot de->en->fr
+        src_de = _get_lang("de")
+        mid_en = _get_lang("en")
+        dst_fr = _get_lang("fr")
+        if src_de and mid_en and dst_fr:
+            try:
+                _tr_log("Using Argos pivot de->en->fr")
+                tr_de_en = src_de.get_translation(mid_en)
+                tr_en_fr = mid_en.get_translation(dst_fr)
+                _ARGOS_CHAIN = (tr_de_en, tr_en_fr)
+                _ARGOS_TRANSLATOR = None
+                _ARGOS_READY = True
+                return True
+            except Exception:
+                pass
+
+        return False
+    except Exception:
+        return False
+
+def _load_fasttext_model() -> bool:
+    global _FASTTEXT_MODEL
+    if _FASTTEXT_MODEL is not None:
+        return True
+    if not FASTTEXT_AVAILABLE:
+        _tr_log("fastText not available (import failed).")
+        return False
+    candidates = [
+        os.path.join(resource_path(FASTTEXT_MODEL_DIR), FASTTEXT_LANG_MODEL),
+        os.path.join(os.path.abspath("."), FASTTEXT_MODEL_DIR, FASTTEXT_LANG_MODEL),
+    ]
+    model_path = next((p for p in candidates if p and os.path.exists(p)), None)
+    if not model_path:
+        _tr_log("fastText model not found.")
+        return False
+    try:
+        _FASTTEXT_MODEL = fasttext.load_model(model_path)
+        _tr_log(f"fastText model loaded: {model_path}")
+        return True
+    except Exception:
+        _FASTTEXT_MODEL = None
+        return False
+
+def _detect_language(text: str) -> tuple[str | None, float]:
+    if not _load_fasttext_model():
+        if not LANGID_AVAILABLE:
+            return None, 0.0
+        try:
+            lang, score = langid.classify(text)
+            _tr_log(f"Lang detect (langid): '{text[:60]}' -> {lang} ({score:.2f})")
+            return lang, float(score)
+        except Exception:
+            _tr_log("Lang detect error (langid).")
+            return None, 0.0
+    try:
+        sample = re.sub(r"\s+", " ", text.strip())[:1000]
+        try:
+            labels, probs = _FASTTEXT_MODEL.predict(sample, k=1)
+        except Exception:
+            sample = sample.encode("utf-8", "ignore").decode("utf-8")
+            labels, probs = _FASTTEXT_MODEL.predict(sample, k=1)
+        if not labels:
+            return None, 0.0
+        lang = labels[0].replace("__label__", "")
+        prob = float(probs[0]) if probs else 0.0
+        _tr_log(f"Lang detect: '{sample[:60]}' -> {lang} ({prob:.2f})")
+        return lang, prob
+    except Exception:
+        _tr_log("Lang detect error (fasttext).")
+        if LANGID_AVAILABLE:
+            try:
+                lang, score = langid.classify(text)
+                _tr_log(f"Lang detect (langid): '{text[:60]}' -> {lang} ({score:.2f})")
+                return lang, float(score)
+            except Exception:
+                _tr_log("Lang detect error (langid).")
+        return None, 0.0
+
+def _is_german_text(text: str) -> bool:
+    if not text:
+        return False
+    stripped = text.strip()
+    if not stripped:
+        return False
+    # Heuristic: German hints
+    if GERMAN_HINT_RE.search(stripped):
+        return True
+    lang, prob = _detect_language(stripped)
+    if lang in ("de", "deu") and prob >= LANG_DETECT_MIN_PROB:
+        return True
+    return False
+
+def _should_translate_text(text: str, block_german: bool = False) -> bool:
+    if not text:
+        return False
+    stripped = text.strip()
+    if not stripped:
+        return False
+    # Skip mostly numbers/symbols
+    if re.fullmatch(r"[\d\s\W]+", stripped):
+        return False
+    # Skip very short tokens without letters
+    if not re.search(r"[A-Za-zÀ-ÿÄÖÜäöüß]", stripped):
+        return False
+    if block_german:
+        return True
+    return _is_german_text(stripped)
+
+def _apply_post_edits(text: str, post_edits: dict) -> str:
+    if not text or not post_edits:
+        return text
+    out = text
+    for src, dst in post_edits.items():
+        if not src:
             continue
-        parts[i] = _apply(part)
+        out = re.sub(r"(?i)" + re.escape(src), dst, out)
+    return out
 
-    return "".join(parts)
+def _translate_plain_text(text: str, mapping: dict, post_edits: dict, block_german: bool = False) -> tuple[str, bool, bool]:
+    """
+    Returns (translated_text, did_translate, was_german)
+    """
+    if text in mapping:
+        mapped = _apply_post_edits(mapping[text], post_edits)
+        return mapped, True, False
+    was_german = _should_translate_text(text, block_german=block_german)
+    if not was_german:
+        _tr_log(f"Skip (not German): {text[:80]}")
+        edited = _apply_post_edits(text, post_edits)
+        if edited != text:
+            return edited, True, False
+        return text, False, False
+    if not _ensure_argos_translator():
+        _tr_log("Argos not ready; skip translation.")
+        edited = _apply_post_edits(text, post_edits)
+        if edited != text:
+            return edited, True, True
+        return text, False, True
+    try:
+        masked, tokens = _mask_protected_tokens(text)
+        if _ARGOS_TRANSLATOR:
+            _tr_log("Translate via Argos direct.")
+            translated = _ARGOS_TRANSLATOR.translate(masked)
+        elif _ARGOS_CHAIN:
+            _tr_log("Translate via Argos pivot.")
+            mid = _ARGOS_CHAIN[0].translate(masked)
+            translated = _ARGOS_CHAIN[1].translate(mid)
+        else:
+            return text, False, True
+        if translated:
+            translated = _unmask_protected_tokens(translated, tokens)
+            translated = _apply_post_edits(translated, post_edits)
+            if translated.strip() != text.strip():
+                return translated, True, True
+    except Exception:
+        pass
+    edited = _apply_post_edits(text, post_edits)
+    if edited != text:
+        return edited, True, True
+    return text, False, True
 
-def _find_untranslated_labels(html: str, mapping: dict) -> list:
-    missing = []
+def _translate_html_fragment(html: str, mapping: dict, post_edits: dict) -> str:
     if not html:
-        return missing
-    # Capture all header cells (keys/sections/categories)
-    for m in re.finditer(r"<th[^>]*>(.*?)</th>", html, re.DOTALL | re.IGNORECASE):
-        raw = m.group(1) or ""
-        text = re.sub(r"<[^>]+>", "", raw)
-        text = _html.unescape(text).strip()
-        if not text:
+        return html
+    soup = BeautifulSoup(html, "html.parser")
+    # Decide at fragment level to reduce missed German nodes
+    raw_texts = [t.strip() for t in soup.find_all(string=True) if t and t.strip()]
+    visible_text = " ".join(raw_texts)
+    block_german = False
+    if len(visible_text) >= 20:
+        block_german = _is_german_text(visible_text)
+    if not block_german:
+        for t in raw_texts:
+            if _is_german_text(t):
+                block_german = True
+                break
+        _tr_log(f"Block detect: '{visible_text[:80]}' -> german={block_german}")
+    translated_nodes = 0
+    for node in soup.find_all(string=True):
+        if isinstance(node, Comment):
             continue
-        if text in mapping:
+        parent = node.parent
+        if parent and parent.name in ("style", "script"):
             continue
-        if text not in missing:
-            missing.append(text)
-    return missing
+        raw = str(node)
+        if not raw.strip():
+            continue
+        leading = re.match(r"^\s*", raw).group(0)
+        trailing = re.match(r".*?(\s*)$", raw, re.DOTALL).group(1)
+        core = raw.strip()
+        translated, did, _ = _translate_plain_text(core, mapping, post_edits, block_german=block_german)
+        if did:
+            translated_nodes += 1
+            node.replace_with(f"{leading}{translated}{trailing}")
+    _tr_log(f"HTML fragment translated nodes: {translated_nodes}")
+    if soup.body:
+        return "".join(str(x) for x in soup.body.contents)
+    return str(soup)
+
+def _build_table_from_snapshot(snapshot, left_h, right_h, translate_label_fn, translate_value_fn):
+    lines = []
+    lines.append(SPEC_TABLE_CSS)
+    lines.append('<table border="1" class="specs">')
+    lines.append("\t<thead>")
+    lines.append("\t\t<tr>")
+    lines.append(f"\t\t\t<th>{_escape_html(translate_label_fn(left_h))}</th>")
+    lines.append(f"\t\t\t<th>{_escape_html(translate_label_fn(right_h))}</th>")
+    lines.append("\t\t</tr>")
+    lines.append("\t</thead>")
+    lines.append("\t<tbody>")
+
+    for kind, a, b in snapshot:
+        if kind == "section":
+            title = _escape_html(translate_label_fn(a))
+            lines.append('\t\t<tr class="section">')
+            lines.append(f'\t\t\t<th class="section" colspan="2">{title}</th>')
+            lines.append('\t\t</tr>')
+        elif kind == "cat":
+            title = _escape_html(translate_label_fn(a))
+            lines.append('\t\t<tr class="cat">')
+            lines.append(f'\t\t\t<th class="category" colspan="2">{title}</th>')
+            lines.append('\t\t</tr>')
+        else:
+            k = _escape_html(translate_label_fn(a))
+            v = translate_value_fn(b)
+            if not (k or v):
+                continue
+            lines.append("\t\t<tr>")
+            lines.append(f"\t\t\t<th>{k}</th>")
+            lines.append(f"\t\t\t<td>{v}</td>")
+            lines.append("\t\t</tr>")
+
+    lines.append("\t</tbody>")
+    lines.append("</table>")
+    return "\n".join(lines)
+
+class ExportWorker(QThread):
+    finished = Signal(dict)
+
+    def __init__(self, snapshot, left_h, right_h, path_de, path_fr, parent=None):
+        super().__init__(parent)
+        self.snapshot = snapshot
+        self.left_h = left_h
+        self.right_h = right_h
+        self.path_de = path_de
+        self.path_fr = path_fr
+
+    def run(self):
+        result = {"ok": False, "error": None, "missing": [], "argos": False, "fasttext": False}
+        try:
+            mapping = dict(_FR_TRANSLATIONS)
+            mapping.update(_load_fr_translations())
+            post_edits = dict(FR_POST_EDITS)
+            post_edits.update(_load_fr_post_edits())
+            argos_ready = _ensure_argos_translator()
+            fasttext_ready = _load_fasttext_model()
+            result["argos"] = argos_ready
+            result["fasttext"] = fasttext_ready
+
+            missing_fr = []
+
+            def _translate_label(text: str) -> str:
+                translated, did, was_german = _translate_plain_text(text, mapping, post_edits)
+                if was_german and not did and text not in missing_fr:
+                    missing_fr.append(text)
+                return translated
+
+            def _translate_value(value_html: str) -> str:
+                return _translate_html_fragment(value_html, mapping, post_edits)
+
+            out = _build_table_from_snapshot(
+                self.snapshot, self.left_h, self.right_h, lambda s: s, lambda s: s
+            )
+            out = _normalize_for_paste(out)
+            out_fr = _build_table_from_snapshot(
+                self.snapshot, self.left_h, self.right_h, _translate_label, _translate_value
+            )
+
+            with open(self.path_de, "w", encoding="utf-8") as f:
+                f.write(out)
+            with open(self.path_fr, "w", encoding="utf-8") as f:
+                f.write(out_fr)
+
+            result["ok"] = True
+            result["missing"] = missing_fr
+        except Exception as e:
+            result["error"] = str(e)
+        self.finished.emit(result)
 
 def _sanitize_value_html(html: str) -> str:
     # remove only font-family/font-size and Qt-specific noise from inline styles
@@ -449,6 +837,17 @@ def _scrape_log(msg: str):
         os.makedirs("output", exist_ok=True)
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with open(os.path.join("output", "scrape.log"), "a", encoding="utf-8") as f:
+            f.write(f"[{ts}] {msg}\n")
+    except Exception:
+        pass
+
+def _tr_log(msg: str):
+    if not TRANSLATION_DEBUG:
+        return
+    try:
+        os.makedirs("output", exist_ok=True)
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(os.path.join("output", "translate.log"), "a", encoding="utf-8") as f:
             f.write(f"[{ts}] {msg}\n")
     except Exception:
         pass
@@ -1290,10 +1689,13 @@ class MainWindow(QMainWindow):
         # Footer (export)
         footer = QHBoxLayout();
         footer.setSpacing(12)
+        self.chk_only_de = QCheckBox("Nur Deutsch")
+        self.chk_only_de.setToolTip("Nur die deutsche Version exportieren")
         self.btn_export = QPushButton("Exportieren");
         self.btn_export.setObjectName("primaryButton")
         self.btn_export.clicked.connect(self.export_table_only)
         footer.addStretch(1);
+        footer.addWidget(self.chk_only_de, alignment=Qt.AlignBottom)
         footer.addWidget(self.btn_export, alignment=Qt.AlignBottom)
         shell.addLayout(footer)
 
@@ -1762,55 +2164,6 @@ class MainWindow(QMainWindow):
         left_h = self.hdr_left.text().strip() or DEFAULT_HEADER_LEFT
         right_h = self.hdr_right.text().strip() or DEFAULT_HEADER_RIGHT
 
-        # --- Build HTML table (category rows render full-width) ---
-        lines = []
-        lines.append(SPEC_TABLE_CSS)
-        lines.append('<table border="1" class="specs">')
-        lines.append("\t<thead>")
-        lines.append("\t\t<tr>")
-        lines.append(f"\t\t\t<th>{_escape_html(left_h)}</th>")
-        lines.append(f"\t\t\t<th>{_escape_html(right_h)}</th>")
-        lines.append("\t\t</tr>")
-        lines.append("\t</thead>")
-        lines.append("\t<tbody>")
-
-        for rw in self.rows_widgets:
-            # Section/header row?
-            is_section = hasattr(rw, "header_plain")
-            if is_section:
-                title = _escape_html(rw.header_plain())
-                lines.append('\t\t<tr class="section">')
-                lines.append(f'\t\t\t<th class="section" colspan="2">{title}</th>')
-                lines.append('\t\t</tr>')
-                continue
-
-            # Category row?
-            is_category = hasattr(rw, "title_plain") and not hasattr(rw, "key_plain")
-            if is_category:
-                title = _escape_html(rw.title_plain())
-                lines.append('\t\t<tr class="cat">')
-                lines.append(f'\t\t\t<th class="category" colspan="2">{title}</th>')
-                lines.append('\t\t</tr>')
-            else:
-                k = _escape_html(rw.key_plain())
-                v = rw.val_html()
-                if not (k or v):
-                    continue
-                lines.append("\t\t<tr>")
-                lines.append(f"\t\t\t<th>{k}</th>")
-                lines.append(f"\t\t\t<td>{v}</td>")
-                lines.append("\t\t</tr>")
-
-        lines.append("\t</tbody>")
-        lines.append("</table>")
-
-        out = "\n".join(lines)
-        out = _normalize_for_paste(out)
-        mapping = dict(_FR_TRANSLATIONS)
-        mapping.update(_load_fr_translations())
-        out_fr = _translate_de_to_fr_html(out)
-        missing_fr = _find_untranslated_labels(out, mapping)
-
         # --- Save dialog ---
         base = self.title_in.text().strip() or DEFAULT_EXPORT_TITLE
         base = "".join(ch if ch.isalnum() or ch in (" ", "-", "_") else "_" for ch in base).strip()
@@ -1824,6 +2177,24 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
+        if self.chk_only_de.isChecked():
+            try:
+                snapshot = []
+                for rw in self.rows_widgets:
+                    if hasattr(rw, "header_plain"):
+                        snapshot.append(("section", rw.header_plain(), ""))
+                    elif hasattr(rw, "title_plain") and not hasattr(rw, "key_plain"):
+                        snapshot.append(("cat", rw.title_plain(), ""))
+                    else:
+                        snapshot.append(("kv", rw.key_plain(), rw.val_html()))
+                out = _build_table_from_snapshot(snapshot, left_h, right_h, lambda s: s, lambda s: s)
+                out = _normalize_for_paste(out)
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(out)
+                self.statusBar().showMessage(f"Gespeichert unter: {path}", 4000)
+            except Exception as e:
+                QMessageBox.critical(self, "Speicherfehler", str(e))
+            return
         out_dir = os.path.dirname(path) or "."
         name = os.path.basename(path)
         stem, ext = os.path.splitext(name)
@@ -1833,20 +2204,120 @@ class MainWindow(QMainWindow):
             ext = ".txt"
         path_de = os.path.join(out_dir, f"{stem}_de{ext}")
         path_fr = os.path.join(out_dir, f"{stem}_fr{ext}")
-        try:
-            with open(path_de, "w", encoding="utf-8") as f:
-                f.write(out)
-            with open(path_fr, "w", encoding="utf-8") as f:
-                f.write(out_fr)
-            self.statusBar().showMessage(
-                f"Gespeichert unter: {path_de} und {path_fr}", 5000
-            )
-            if missing_fr:
-                msg = "Nicht übersetzte Begriffe (bitte in translations_fr.json ergänzen):\n\n"
-                msg += "\n".join(missing_fr)
-                QMessageBox.information(self, "Fehlende Übersetzungen", msg)
-        except Exception as e:
-            QMessageBox.critical(self, "Speicherfehler", str(e))
+        snapshot = []
+        for rw in self.rows_widgets:
+            if hasattr(rw, "header_plain"):
+                snapshot.append(("section", rw.header_plain(), ""))
+            elif hasattr(rw, "title_plain") and not hasattr(rw, "key_plain"):
+                snapshot.append(("cat", rw.title_plain(), ""))
+            else:
+                snapshot.append(("kv", rw.key_plain(), rw.val_html()))
+
+        self._show_translate_dialog()
+        self._export_worker = ExportWorker(snapshot, left_h, right_h, path_de, path_fr, self)
+        self._export_worker.finished.connect(
+            lambda result: self._on_export_finished(result, path_de, path_fr)
+        )
+        self._export_worker.start()
+
+    def _show_translate_dialog(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Übersetzen")
+        dlg.setModal(False)
+        dlg.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool)
+        dlg.setAttribute(Qt.WA_TranslucentBackground, True)
+        dlg.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        dlg.setStyleSheet("background: transparent;")
+
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.setAlignment(Qt.AlignCenter)
+
+        host = QWidget()
+        host.setStyleSheet("background:#006b8d; border-radius:10px;")
+        host_layout = QVBoxLayout(host)
+        host_layout.setContentsMargins(12, 10, 12, 10)
+        host_layout.setSpacing(0)
+        host_layout.setSizeConstraint(QLayout.SetFixedSize)
+        host_layout.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
+        layout.addWidget(host)
+
+        gif_label = QLabel()
+        gif_label.setAlignment(Qt.AlignHCenter)
+        gif_path = resource_path("icons/robot_white.gif")
+        movie = QMovie(gif_path)
+        gif_label.setMovie(movie)
+        movie.start()
+        def _scale_movie():
+            rect = movie.frameRect()
+            if rect.isValid():
+                movie.setScaledSize(QSize(max(1, rect.width() // 4), max(1, rect.height() // 4)))
+        movie.jumpToFrame(0)
+        _scale_movie()
+        host_layout.addWidget(gif_label, 0, Qt.AlignHCenter)
+
+        text_label = QLabel()
+        text_label.setAlignment(Qt.AlignHCenter)
+        text_label.setStyleSheet("color:#ffffff; font-weight:bold; font-size:18px; margin-top:-6px;")
+        host_layout.addWidget(text_label, 0, Qt.AlignHCenter)
+
+        target = "Übersetzen"
+        gib = ["xqv!9kz", "k9v!xqz", "qz!9vkx", "9xq!kvz", "zq!9xkv"]
+        frames = []
+        base = gib[0].ljust(len(target))
+        for i in range(len(target) + 1):
+            head = target[:i]
+            tail = base[i:]
+            frames.append(head + tail)
+        frames += [target]
+        idx = {"i": 0, "phase": 0}
+
+        def tick():
+            if idx["phase"] < len(gib):
+                text_label.setText(gib[idx["phase"]])
+                idx["phase"] += 1
+                return
+            text_label.setText(frames[idx["i"] % len(frames)])
+            idx["i"] += 1
+
+        timer = QTimer(dlg)
+        timer.timeout.connect(tick)
+        timer.start(120)
+        tick()
+
+        self._translate_dialog = dlg
+        host.setFixedSize(host.sizeHint())
+        dlg.resize(host.sizeHint())
+        dlg.setFixedSize(host.sizeHint())
+        top_left = self.mapToGlobal(QPoint(0, 0))
+        dlg.move(
+            top_left.x() + (self.width() - dlg.width()) // 2,
+            top_left.y() + (self.height() - dlg.height()) // 2
+        )
+        QTimer.singleShot(100, dlg.show)
+
+    def _on_export_finished(self, result, path_de, path_fr):
+        if getattr(self, "_translate_dialog", None):
+            self._translate_dialog.close()
+            self._translate_dialog = None
+        if not result.get("ok"):
+            QMessageBox.critical(self, "Speicherfehler", result.get("error") or "Unbekannter Fehler")
+            return
+        self.statusBar().showMessage(
+            f"Gespeichert unter: {path_de} und {path_fr}", 5000
+        )
+        missing_fr = result.get("missing") or []
+        if missing_fr:
+            msg = "Nicht übersetzte Begriffe (bitte in translations_fr.json ergänzen):\n\n"
+            if not result.get("argos"):
+                msg = ("Offline-Übersetzer (Argos) nicht verfügbar. "
+                       "Bitte Argos-Modell in argos_models ablegen.\n\n") + msg
+            if not result.get("fasttext"):
+                msg = ("Spracherkennung (fastText) nicht verfügbar. "
+                       "Bitte lid.176.ftz in fasttext_models ablegen.\n\n") + msg
+            msg += "\n".join(missing_fr)
+            QMessageBox.information(self, "Fehlende Übersetzungen", msg)
 
     def _parse_specs_file(self, content: str):
         """

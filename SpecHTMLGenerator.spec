@@ -18,6 +18,9 @@ datas = [
     ('icons', 'icons'),
     ('auto_update.py', '.'),
     ('translations_fr.json', '.'),
+    ('translations_fr_post.json', '.'),
+    ('argos_models', 'argos_models'),
+    ('fasttext_models', 'fasttext_models'),
 ]
 
 # Hidden imports
@@ -28,6 +31,11 @@ hiddenimports = [
     'requests',
     'packaging',
     'packaging.version',
+    'argostranslate',
+    'argostranslate.package',
+    'argostranslate.translate',
+    'fasttext',
+    'langid',
 ]
 
 # Analysis

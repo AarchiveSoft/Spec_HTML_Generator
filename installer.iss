@@ -3,7 +3,7 @@
 ; Output to installer_output/
 
 #define MyAppName "Claudias Listenwichtel"
-#define MyAppVersion "2.1.0"
+#define MyAppVersion "2.1.1"
 #define MyAppPublisher "GraphicArt"
 #define MyAppExeName "SpecHTMLGenerator.exe"
 #define MyAppURL "https://graphicart.ch"
@@ -76,6 +76,13 @@ Source: "icons\*"; DestDir: "{app}\icons"; Flags: ignoreversion recursesubdirs c
 
 ; Optional translations file for French export
 Source: "translations_fr.json"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "translations_fr_post.json"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+
+; Argos Translate offline models (DE→FR)
+Source: "argos_models\*"; DestDir: "{app}\argos_models"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
+
+; fastText language ID model
+Source: "fasttext_models\*"; DestDir: "{app}\fasttext_models"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
 
 [Icons]
 ; Start Menu - use user's start menu, not common

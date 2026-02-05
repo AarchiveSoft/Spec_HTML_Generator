@@ -106,3 +106,5 @@ __pycache__/
 /.venv/*
 /.idea/
 /.claude/
+/argos_models/translate-de_en.argosmodel
+/argos_models/translate-en_fr.argosmodel

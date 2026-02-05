@@ -22,7 +22,7 @@ except ImportError:
 # -----------------------------------------------------------------------------
 # Configuration
 # -----------------------------------------------------------------------------
-CURRENT_VERSION = "2.1.0"
+CURRENT_VERSION = "2.1.1"
 UPDATE_SERVER = "https://downloads.graphicart.ch/ListenWichtel"
 VERSION_JSON_URL = f"{UPDATE_SERVER}/version.json"
 

@@ -12,5 +12,10 @@ packaging>=21.0
 selenium>=4.20.0
 beautifulsoup4>=4.12.0
 
+# Translation (offline)
+argostranslate>=1.9.6
+fasttext-wheel>=0.9.2
+langid>=1.1.6
+
 # Build Tools (development)
 pyinstaller>=6.0.0
