@@ -6,6 +6,8 @@ import threading
 import re
 import json
 import html as _html
+import time
+import winreg
 from datetime import datetime
 from PySide6.QtCore import Qt, QSize, QTimer, Signal, QPoint, Slot, QThread, QStandardPaths, QUrl
 from PySide6.QtGui import (
@@ -29,25 +31,20 @@ from selenium.webdriver.edge.options import Options as EdgeOptions
 from selenium.common.exceptions import WebDriverException
 from bs4 import BeautifulSoup, Comment
 
-# Translation deps (optional until used)
-try:
-    import argostranslate.package as argos_package
-    import argostranslate.translate as argos_translate
-    ARGOS_AVAILABLE = True
-except ImportError:
-    ARGOS_AVAILABLE = False
+# Translation deps (OpenAI via HTTP)
+OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
+OPENAI_MODEL = "gpt-4.1-mini"
+OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
+OPENAI_TIMEOUT_SEC = 180
+OPENAI_MAX_RETRIES = 3
+OPENAI_RETRY_BACKOFF_SEC = 2
+
 
 try:
-    import fasttext
-    FASTTEXT_AVAILABLE = True
+    import requests
+    REQUESTS_AVAILABLE = True
 except ImportError:
-    FASTTEXT_AVAILABLE = False
-
-try:
-    import langid
-    LANGID_AVAILABLE = True
-except ImportError:
-    LANGID_AVAILABLE = False
+    REQUESTS_AVAILABLE = False
 
 # Import auto-update module (graceful fallback if not available)
 try:
@@ -87,56 +84,6 @@ SCRAPE_EXCLUDE_SECTIONS = {
     "weiterführende links",
 }
 
-ARGOS_MODEL_DIR = "argos_models"
-ARGOS_LANG_FROM = "de"
-ARGOS_LANG_TO = "fr"
-LANG_DETECT_MIN_PROB = 0.3
-FASTTEXT_MODEL_DIR = "fasttext_models"
-FASTTEXT_LANG_MODEL = "lid.176.ftz"
-TRANSLATION_DEBUG = os.environ.get("SPEC_TRANSLATE_DEBUG") == "1"
-GERMAN_HINT_RE = re.compile(
-    r"(?:\b(und|oder|mit|für|ohne|nicht|kein|keine|einen|eine|der|die|das|von|bis|nach|über|unter|bei|auf|aus|mehr|weniger|zwischen|funktion|sucher|optisch|extern|betriebsbereit|farbkanal|synchronzeit|kleinbild|gesicht)\b|[äöüÄÖÜß])",
-    re.IGNORECASE
-)
-FR_POST_EDITS = {
-    "petite image": "plein format",
-    "crop facteur": "facteur de recadrage",
-}
-
-PROTECTED_TOKEN_PATTERNS = [
-    r"\b[A-Z0-9][A-Z0-9\-_/\.]{2,}\b",  # acronyms/model codes (USB, HDMI, NP-FZ100)
-    r"\bISO\s?\d+(?:[\-–]\d+)?\b",
-    r"\b\d+(?:[.,]\d+)?\s?(?:mm|cm|m|µm|nm|°|s|EV|W|Wh|mAh|GHz|MHz|K|Bit|bits|B/s|BpS|fps)\b",
-    r"\b\d+(?:[.,]\d+)?\s?[x×]\s?\d+(?:[.,]\d+)?\b",  # resolutions
-    r"\b\d+(?:[.,]\d+)?\s?(?:MBit/s|Mbit/s|Mb/s|Mbps|Gb/s|Gbps)\b",
-    r"\b(?:RAW|JPG|JPEG|HEIF|PNG|TIFF|DCF|EXIF)\b",
-    r"\b(?:Wi-Fi|WLAN|Bluetooth|NFC|USB|HDMI|LAN)\b",
-    r"\b(?:UHS\s?I|UHS\s?II|CFexpress|SDHC|SDXC|SD)\b",
-    r"\b(?:XAVC|H\.264|H\.265|HEVC|AVC)\b",
-    r"\b(?:NTSC|PAL)\b",
-]
-
-def _build_protected_regex():
-    return re.compile("|".join(f"(?:{p})" for p in PROTECTED_TOKEN_PATTERNS), re.IGNORECASE)
-
-_PROTECTED_RE = _build_protected_regex()
-
-def _mask_protected_tokens(text: str) -> tuple[str, list[str]]:
-    if not text:
-        return text, []
-    tokens = []
-    def _repl(m):
-        tokens.append(m.group(0))
-        return f"<<T{len(tokens)-1}>>"
-    return _PROTECTED_RE.sub(_repl, text), tokens
-
-def _unmask_protected_tokens(text: str, tokens: list[str]) -> str:
-    if not tokens:
-        return text
-    out = text
-    for i, tok in enumerate(tokens):
-        out = out.replace(f"<<T{i}>>", tok)
-    return out
 
 SPEC_TABLE_CSS = """
 <style type="text/css">
@@ -334,400 +281,102 @@ def _normalize_for_paste(t: str) -> str:
     # Map ß/ẞ → ss/SS (idempotent)
     return (t or "").replace("ß", "ss").replace("ẞ", "SS")
 
-def _load_fr_translations():
-    # Optional external mapping file: {"Deutsch": "Francais", ...}
-    candidates = [
-        resource_path("translations_fr.json"),
-        os.path.join(os.path.abspath("."), "translations_fr.json"),
-    ]
-    path = next((p for p in candidates if p and os.path.exists(p)), None)
-    if not path:
-        return {}
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return {str(k): str(v) for k, v in (data or {}).items() if str(k)}
-    except Exception:
-        return {}
 
-def _load_fr_post_edits():
-    path = resource_path("translations_fr_post.json")
-    if not path or not os.path.exists(path):
-        return {}
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return {str(k): str(v) for k, v in (data or {}).items() if str(k)}
-    except Exception:
-        return {}
-
-_FR_TRANSLATIONS = {
-    # Core headers
-    "Kategorie": "Catégorie",
-    "Details": "Détails",
-    # Common yes/no
-    "ja": "oui",
-    "nein": "non",
-    "kein": "aucun",
-    "keine": "aucune",
-    # Common section/label terms (expand via translations_fr.json as needed)
-    "Modell": "Modèle",
-    "Markteinführung": "Lancement sur le marché",
-    "Nachfolgermodell": "Modèle successeur",
-    "Kameraklasse(n)": "Classe(s) d’appareil",
-    "Elektronik": "Électronique",
-    "Sensor": "Capteur",
-    "Pixelpitch": "Pas de pixel",
-    "Fotoauflösung": "Résolution photo",
-    "Bildformate": "Formats d’image",
-    "Farbtiefe": "Profondeur de couleur",
-    "Metadaten": "Métadonnées",
-    "Videoauflösung": "Résolution vidéo",
-    "HDR-Video": "Vidéo HDR",
-    "Videoformat": "Format vidéo",
-    "All-Intra-Aufzeichnung": "Enregistrement All-Intra",
-    "Audioformat (Video)": "Format audio (vidéo)",
-    "Objektiv": "Objectif",
-    "Objektivanschluss": "Monture d’objectif",
-    "Fokussierung": "Mise au point",
-    "Autofokusart": "Type d’autofocus",
-    "AF-Erkennungsfunktion": "Fonction de détection AF",
-    "Schärfenkontrolle": "Contrôle de la netteté",
-    "Sucher und Monitor": "Viseur et écran",
-    "Monitor": "Écran",
-    "Videosucher": "Viseur électronique",
-    "Belichtung": "Exposition",
-    "Belichtungsmessung": "Mesure de l’exposition",
-    "Belichtungszeiten": "Vitesses d’obturation",
-    "Belichtungssteuerung": "Commande d’exposition",
-    "Belichtungsreihenfunktion": "Fonction de bracketing d’exposition",
-    "Belichtungskorrektur": "Correction d’exposition",
-    "Lichtempfindlichkeit": "Sensibilité",
-    "Fernzugriff": "Accès à distance",
-    "Weissabgleich": "Balance des blancs",
-    "Farbraum": "Espace colorimétrique",
-    "Serienaufnahmen": "Prises de vue en rafale",
-    "Selbstauslöser": "Retardateur",
-    "Timer": "Minuterie",
-    "Aufnahmefunktionen": "Fonctions de prise de vue",
-    "Blitzgerät": "Flash",
-    "Blitz": "Flash",
-    "Blitzreichweite": "Portée du flash",
-    "Blitzfunktionen": "Fonctions flash",
-    "Ausstattung": "Équipement",
-    "Bildstabilisator": "Stabilisateur d’image",
-    "Speicher": "Mémoire",
-    "Zweiter Speicherkartensteckplatz": "Deuxième emplacement pour carte mémoire",
-    "Zweiter Speicherkartenslot": "Deuxième emplacement pour carte mémoire",
-    "zweiter Speicherkartenslot": "Deuxième emplacement pour carte mémoire",
-    "GPS-Funktion": "Fonction GPS",
-    "Mikrofon": "Microphone",
-    "Netzteil": "Bloc d’alimentation",
-    "Netztteil": "Bloc d’alimentation",
-    "Stromversorgung": "Alimentation",
-    "Wiedergabefunktionen": "Fonctions de lecture",
-    "Wiedergabe-Funktionen": "Fonctions de lecture",
-    "Bildeinstellungen": "Paramètres d’image",
-    "Bildparameter": "Paramètres d’image",
-    "Spezialfunktionen": "Fonctions spéciales",
-    "Sonder-Funktionen": "Fonctions spéciales",
-    "USB-Typ": "Type USB",
-    "Drahtlos": "Sans fil",
-    "Datenschnittstelle": "Interface de données",
-    "Daten-Schnittstelle": "Interface de données",
-    "AV-Anschlüsse": "Connectiques AV",
-    "HDMI-Output": "HDMI propre",
-    "HDMI-Output-Auflösungen": "Résolutions HDMI propre",
-    "HDMI-Output-Farbraum": "Espace colorimétrique HDMI propre",
-    "HDMI-Output-Bemerkungen": "Remarques HDMI propre",
-    "Clean HDMI": "Clean HDMI",
-    "Clean HDMI Auflösungen": "Résolutions HDMI propre",
-    "Clean HDMI Farbraum": "Espace colorimétrique HDMI propre",
-    "Clean HDMI Anmerkungen": "Remarques HDMI propre",
-    "Webcam-Funktion": "Fonction webcam",
-    "Direktdruckunterstützung": "Procédés d’impression directe pris en charge",
-    "Unterstützte Direkt-Druck-Verfahren": "Procédés d’impression directe pris en charge",
-    "Stativgewinde": "Filetage pour trépied",
-    "Gehäuse": "Boîtier",
-    "Besonderheiten und Sonstiges": "Particularités et divers",
-    "Abmessungen und Gewicht": "Dimensions et poids",
-    "Grösse und Gewicht": "Dimensions et poids",
-    "Abmessungen B x H x T": "Dimensions L x H x P",
-    "Gewicht": "Poids",
-    "Sonstiges": "Divers",
-    "Mitgeliefertes Zubehör": "Accessoires fournis",
-    "mitgeliefertes Zubehör": "Accessoires fournis",
-    "Timecode": "Timecode",
-}
-
-_ARGOS_READY = False
-_ARGOS_TRANSLATOR = None
-_ARGOS_CHAIN = None
-_FASTTEXT_MODEL = None
-
-def _find_argos_model_file() -> str | None:
-    candidates = [
-        resource_path(ARGOS_MODEL_DIR),
-        os.path.join(os.path.abspath("."), ARGOS_MODEL_DIR),
-    ]
-    for base in candidates:
-        if not base or not os.path.isdir(base):
-            continue
-        for name in os.listdir(base):
-            if name.lower().endswith(".argosmodel"):
-                return os.path.join(base, name)
-    return None
-
-def _ensure_argos_translator() -> bool:
-    global _ARGOS_READY, _ARGOS_TRANSLATOR
-    global _ARGOS_CHAIN
-    if _ARGOS_READY and (_ARGOS_TRANSLATOR or _ARGOS_CHAIN):
-        return True
-    if not ARGOS_AVAILABLE:
-        _tr_log("Argos not available (import failed).")
-        return False
-    try:
-        langs = argos_translate.get_installed_languages()
-        _tr_log(f"Argos installed langs: {[l.code for l in langs]}")
-        def _get_lang(code: str):
-            return next((l for l in langs if l.code == code), None)
-
-        def _refresh_langs():
-            nonlocal langs
-            langs = argos_translate.get_installed_languages()
-
-        # Try direct de->fr
-        src = _get_lang(ARGOS_LANG_FROM)
-        dst = _get_lang(ARGOS_LANG_TO)
-        if src and dst:
-            try:
-                _ARGOS_TRANSLATOR = src.get_translation(dst)
-                _ARGOS_CHAIN = None
-                _ARGOS_READY = True
-                return True
-            except Exception:
-                pass
-
-        # Install any bundled models (if not already installed)
-        model_path = _find_argos_model_file()
-        if model_path:
-            try:
-                _tr_log(f"Installing Argos model from {model_path}")
-                argos_package.install_from_path(model_path)
-                _refresh_langs()
-            except Exception:
-                pass
-
-        # Try direct again after install
-        src = _get_lang(ARGOS_LANG_FROM)
-        dst = _get_lang(ARGOS_LANG_TO)
-        if src and dst:
-            try:
-                _ARGOS_TRANSLATOR = src.get_translation(dst)
-                _ARGOS_CHAIN = None
-                _ARGOS_READY = True
-                return True
-            except Exception:
-                pass
-
-        # Fallback: pivot de->en->fr
-        src_de = _get_lang("de")
-        mid_en = _get_lang("en")
-        dst_fr = _get_lang("fr")
-        if src_de and mid_en and dst_fr:
-            try:
-                _tr_log("Using Argos pivot de->en->fr")
-                tr_de_en = src_de.get_translation(mid_en)
-                tr_en_fr = mid_en.get_translation(dst_fr)
-                _ARGOS_CHAIN = (tr_de_en, tr_en_fr)
-                _ARGOS_TRANSLATOR = None
-                _ARGOS_READY = True
-                return True
-            except Exception:
-                pass
-
-        return False
-    except Exception:
-        return False
-
-def _load_fasttext_model() -> bool:
-    global _FASTTEXT_MODEL
-    if _FASTTEXT_MODEL is not None:
-        return True
-    if not FASTTEXT_AVAILABLE:
-        _tr_log("fastText not available (import failed).")
-        return False
-    candidates = [
-        os.path.join(resource_path(FASTTEXT_MODEL_DIR), FASTTEXT_LANG_MODEL),
-        os.path.join(os.path.abspath("."), FASTTEXT_MODEL_DIR, FASTTEXT_LANG_MODEL),
-    ]
-    model_path = next((p for p in candidates if p and os.path.exists(p)), None)
-    if not model_path:
-        _tr_log("fastText model not found.")
-        return False
-    try:
-        _FASTTEXT_MODEL = fasttext.load_model(model_path)
-        _tr_log(f"fastText model loaded: {model_path}")
-        return True
-    except Exception:
-        _FASTTEXT_MODEL = None
-        return False
-
-def _detect_language(text: str) -> tuple[str | None, float]:
-    if not _load_fasttext_model():
-        if not LANGID_AVAILABLE:
-            return None, 0.0
-        try:
-            lang, score = langid.classify(text)
-            _tr_log(f"Lang detect (langid): '{text[:60]}' -> {lang} ({score:.2f})")
-            return lang, float(score)
-        except Exception:
-            _tr_log("Lang detect error (langid).")
-            return None, 0.0
-    try:
-        sample = re.sub(r"\s+", " ", text.strip())[:1000]
-        try:
-            labels, probs = _FASTTEXT_MODEL.predict(sample, k=1)
-        except Exception:
-            sample = sample.encode("utf-8", "ignore").decode("utf-8")
-            labels, probs = _FASTTEXT_MODEL.predict(sample, k=1)
-        if not labels:
-            return None, 0.0
-        lang = labels[0].replace("__label__", "")
-        prob = float(probs[0]) if probs else 0.0
-        _tr_log(f"Lang detect: '{sample[:60]}' -> {lang} ({prob:.2f})")
-        return lang, prob
-    except Exception:
-        _tr_log("Lang detect error (fasttext).")
-        if LANGID_AVAILABLE:
-            try:
-                lang, score = langid.classify(text)
-                _tr_log(f"Lang detect (langid): '{text[:60]}' -> {lang} ({score:.2f})")
-                return lang, float(score)
-            except Exception:
-                _tr_log("Lang detect error (langid).")
-        return None, 0.0
-
-def _is_german_text(text: str) -> bool:
+def _strip_code_fences(text: str) -> str:
     if not text:
-        return False
-    stripped = text.strip()
-    if not stripped:
-        return False
-    # Heuristic: German hints
-    if GERMAN_HINT_RE.search(stripped):
-        return True
-    lang, prob = _detect_language(stripped)
-    if lang in ("de", "deu") and prob >= LANG_DETECT_MIN_PROB:
-        return True
-    return False
-
-def _should_translate_text(text: str, block_german: bool = False) -> bool:
-    if not text:
-        return False
-    stripped = text.strip()
-    if not stripped:
-        return False
-    # Skip mostly numbers/symbols
-    if re.fullmatch(r"[\d\s\W]+", stripped):
-        return False
-    # Skip very short tokens without letters
-    if not re.search(r"[A-Za-zÀ-ÿÄÖÜäöüß]", stripped):
-        return False
-    if block_german:
-        return True
-    return _is_german_text(stripped)
-
-def _apply_post_edits(text: str, post_edits: dict) -> str:
-    if not text or not post_edits:
         return text
-    out = text
-    for src, dst in post_edits.items():
-        if not src:
-            continue
-        out = re.sub(r"(?i)" + re.escape(src), dst, out)
-    return out
+    raw = text.strip()
+    if raw.startswith("```"):
+        lines = raw.splitlines()
+        if len(lines) >= 2 and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        return "\n".join(lines).strip()
+    return raw
 
-def _translate_plain_text(text: str, mapping: dict, post_edits: dict, block_german: bool = False) -> tuple[str, bool, bool]:
-    """
-    Returns (translated_text, did_translate, was_german)
-    """
-    if text in mapping:
-        mapped = _apply_post_edits(mapping[text], post_edits)
-        return mapped, True, False
-    was_german = _should_translate_text(text, block_german=block_german)
-    if not was_german:
-        _tr_log(f"Skip (not German): {text[:80]}")
-        edited = _apply_post_edits(text, post_edits)
-        if edited != text:
-            return edited, True, False
-        return text, False, False
-    if not _ensure_argos_translator():
-        _tr_log("Argos not ready; skip translation.")
-        edited = _apply_post_edits(text, post_edits)
-        if edited != text:
-            return edited, True, True
-        return text, False, True
-    try:
-        masked, tokens = _mask_protected_tokens(text)
-        if _ARGOS_TRANSLATOR:
-            _tr_log("Translate via Argos direct.")
-            translated = _ARGOS_TRANSLATOR.translate(masked)
-        elif _ARGOS_CHAIN:
-            _tr_log("Translate via Argos pivot.")
-            mid = _ARGOS_CHAIN[0].translate(masked)
-            translated = _ARGOS_CHAIN[1].translate(mid)
-        else:
-            return text, False, True
-        if translated:
-            translated = _unmask_protected_tokens(translated, tokens)
-            translated = _apply_post_edits(translated, post_edits)
-            if translated.strip() != text.strip():
-                return translated, True, True
-    except Exception:
-        pass
-    edited = _apply_post_edits(text, post_edits)
-    if edited != text:
-        return edited, True, True
-    return text, False, True
 
-def _translate_html_fragment(html: str, mapping: dict, post_edits: dict) -> str:
+def _openai_translate_html(html: str) -> str:
     if not html:
         return html
-    soup = BeautifulSoup(html, "html.parser")
-    # Decide at fragment level to reduce missed German nodes
-    raw_texts = [t.strip() for t in soup.find_all(string=True) if t and t.strip()]
-    visible_text = " ".join(raw_texts)
-    block_german = False
-    if len(visible_text) >= 20:
-        block_german = _is_german_text(visible_text)
-    if not block_german:
-        for t in raw_texts:
-            if _is_german_text(t):
-                block_german = True
-                break
-        _tr_log(f"Block detect: '{visible_text[:80]}' -> german={block_german}")
-    translated_nodes = 0
-    for node in soup.find_all(string=True):
-        if isinstance(node, Comment):
-            continue
-        parent = node.parent
-        if parent and parent.name in ("style", "script"):
-            continue
-        raw = str(node)
-        if not raw.strip():
-            continue
-        leading = re.match(r"^\s*", raw).group(0)
-        trailing = re.match(r".*?(\s*)$", raw, re.DOTALL).group(1)
-        core = raw.strip()
-        translated, did, _ = _translate_plain_text(core, mapping, post_edits, block_german=block_german)
-        if did:
-            translated_nodes += 1
-            node.replace_with(f"{leading}{translated}{trailing}")
-    _tr_log(f"HTML fragment translated nodes: {translated_nodes}")
-    if soup.body:
-        return "".join(str(x) for x in soup.body.contents)
-    return str(soup)
+    if not REQUESTS_AVAILABLE:
+        raise RuntimeError("Requests ist nicht verfügbar. Bitte requests installieren.")
+    api_key = (os.environ.get(OPENAI_API_KEY_ENV) or "").strip()
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY fehlt. Bitte API-Key setzen oder 'Nur Deutsch' aktivieren.")
+    system_prompt = (
+        "You are a deterministic HTML localization engine (German -> French) for camera specifications.\n"
+        "Critical constraints:\n"
+        "- Output MUST be valid HTML and MUST preserve the input structure exactly.\n"
+        "- Do NOT add explanations, markdown, or code fences. Output ONLY the translated HTML.\n"
+        "- Do NOT reorder, reindent, prettify, or normalize anything.\n"
+        "- Do NOT change ANYTHING inside <style>...</style> or <script>...</script> blocks.\n"
+        "- Do NOT translate attribute values, URLs, IDs, classes, data-* attributes, comments, or entities.\n"
+        "- Only translate German in visible text nodes (and keep English as-is).\n"
+    )
+
+    user_prompt = (
+        "Translate the following HTML from German to French.\n\n"
+        "Rules (must follow exactly):\n"
+        "1) Preserve HTML perfectly:\n"
+        "   - Keep every tag, nesting, attribute name/value, whitespace inside tags, comments, and entities unchanged.\n"
+        "   - Do not modify <style>...</style> content at all (leave CSS untouched).\n"
+        "   - Do not modify <script>...</script>, <code>, or <pre> content.\n"
+        "   - Never translate anything inside HTML attributes.\n\n"
+        "2) Translate ONLY German text that is visible to the user:\n"
+        "   - Translate German words/sentences in text nodes to natural French.\n"
+        "   - Do NOT translate English words/phrases already present (assume they should remain English).\n"
+        "   - Do NOT translate brand names, model names, product names, abbreviations, or standards.\n"
+        "   - Keep numbers, units, symbols, and technical abbreviations unchanged (mm, MP, ISO, EV, fps, Wi-Fi, RAW, JPEG, etc.).\n\n"
+        "3) Camera-spec terminology (domain aware, avoid literal translations):\n"
+        "   - Use established French photo terms.\n"
+        "   - Examples: Kleinbild/Vollformat -> plein format; Bildstabilisierung -> stabilisation d’image; "
+        "Brennweite -> focale; Blende -> ouverture; Verschlusszeit -> vitesse d’obturation; "
+        "Serienaufnahme -> rafale; Sucher -> viseur; Elektronischer Sucher -> viseur électronique; "
+        "Belichtungsmessung -> mesure de l’exposition; Weissabgleich -> balance des blancs; "
+        "Wetterfest/Spritzwasserschutz -> tropicalisé/protection contre les intempéries (choose best fit).\n\n"
+        "4) Return ONLY the translated HTML.\n\n"
+        "HTML:\n"
+    )
+    payload = {
+        "model": OPENAI_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt + html},
+        ],
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "presence_penalty": 0.0,
+        "frequency_penalty": 0.0,
+    }
+    last_error = None
+    for attempt in range(OPENAI_MAX_RETRIES):
+        try:
+            resp = requests.post(
+                OPENAI_API_URL,
+                headers={"Authorization": f"Bearer {api_key}"},
+                json=payload,
+                timeout=OPENAI_TIMEOUT_SEC,
+            )
+            if resp.status_code != 200:
+                raise RuntimeError(f"OpenAI-Fehler: {resp.status_code} {resp.text}")
+            data = resp.json()
+            content = data["choices"][0]["message"]["content"]
+            return _strip_code_fences(content)
+        except requests.exceptions.Timeout as e:
+            last_error = e
+            if attempt < OPENAI_MAX_RETRIES - 1:
+                time.sleep(OPENAI_RETRY_BACKOFF_SEC * (2 ** attempt))
+                continue
+            raise RuntimeError("OpenAI-Fehler: Request timeout.") from e
+        except requests.exceptions.RequestException as e:
+            last_error = e
+            if attempt < OPENAI_MAX_RETRIES - 1:
+                time.sleep(OPENAI_RETRY_BACKOFF_SEC * (2 ** attempt))
+                continue
+            raise RuntimeError(f"OpenAI-Fehler: {e}") from e
+    raise RuntimeError(f"OpenAI-Fehler: {last_error}")
+
 
 def _build_table_from_snapshot(snapshot, left_h, right_h, translate_label_fn, translate_value_fn):
     lines = []
@@ -778,35 +427,13 @@ class ExportWorker(QThread):
         self.path_fr = path_fr
 
     def run(self):
-        result = {"ok": False, "error": None, "missing": [], "argos": False, "fasttext": False}
+        result = {"ok": False, "error": None}
         try:
-            mapping = dict(_FR_TRANSLATIONS)
-            mapping.update(_load_fr_translations())
-            post_edits = dict(FR_POST_EDITS)
-            post_edits.update(_load_fr_post_edits())
-            argos_ready = _ensure_argos_translator()
-            fasttext_ready = _load_fasttext_model()
-            result["argos"] = argos_ready
-            result["fasttext"] = fasttext_ready
-
-            missing_fr = []
-
-            def _translate_label(text: str) -> str:
-                translated, did, was_german = _translate_plain_text(text, mapping, post_edits)
-                if was_german and not did and text not in missing_fr:
-                    missing_fr.append(text)
-                return translated
-
-            def _translate_value(value_html: str) -> str:
-                return _translate_html_fragment(value_html, mapping, post_edits)
-
             out = _build_table_from_snapshot(
                 self.snapshot, self.left_h, self.right_h, lambda s: s, lambda s: s
             )
             out = _normalize_for_paste(out)
-            out_fr = _build_table_from_snapshot(
-                self.snapshot, self.left_h, self.right_h, _translate_label, _translate_value
-            )
+            out_fr = _openai_translate_html(out)
 
             with open(self.path_de, "w", encoding="utf-8") as f:
                 f.write(out)
@@ -814,7 +441,6 @@ class ExportWorker(QThread):
                 f.write(out_fr)
 
             result["ok"] = True
-            result["missing"] = missing_fr
         except Exception as e:
             result["error"] = str(e)
         self.finished.emit(result)
@@ -837,17 +463,6 @@ def _scrape_log(msg: str):
         os.makedirs("output", exist_ok=True)
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with open(os.path.join("output", "scrape.log"), "a", encoding="utf-8") as f:
-            f.write(f"[{ts}] {msg}\n")
-    except Exception:
-        pass
-
-def _tr_log(msg: str):
-    if not TRANSLATION_DEBUG:
-        return
-    try:
-        os.makedirs("output", exist_ok=True)
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        with open(os.path.join("output", "translate.log"), "a", encoding="utf-8") as f:
             f.write(f"[{ts}] {msg}\n")
     except Exception:
         pass
@@ -1705,8 +1320,31 @@ class MainWindow(QMainWindow):
 
         self.updateFound.connect(self._show_update_dialog_slot)
         self.statusBar().showMessage("Bereit")
+        QTimer.singleShot(0, self._ensure_openai_key_state)
 
     # ---------- Auto-Update Methods ----------
+    def _ensure_openai_key_state(self):
+        api_key = (os.environ.get(OPENAI_API_KEY_ENV) or "").strip()
+        if not api_key:
+            try:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
+                    api_key = winreg.QueryValueEx(key, OPENAI_API_KEY_ENV)[0]
+                    api_key = (api_key or "").strip()
+            except OSError:
+                api_key = ""
+        if api_key:
+            os.environ[OPENAI_API_KEY_ENV] = api_key
+        if api_key:
+            self.chk_only_de.setEnabled(True)
+            return
+        self.chk_only_de.setChecked(True)
+        self.chk_only_de.setEnabled(False)
+        msg = (
+            "OPENAI_API_KEY fehlt. Übersetzungen sind aktuell nicht verfügbar.\n\n"
+            "Der Export ist daher auf Deutsch beschränkt."
+        )
+        QMessageBox.information(self, "Übersetzung deaktiviert", msg)
+
     def _start_update_check(self):
         """Start silent background update check."""
         if not AUTO_UPDATE_AVAILABLE:
@@ -1841,6 +1479,7 @@ class MainWindow(QMainWindow):
         self._scrape_progress = QProgressDialog(
             "Spezifikationen werden geladen…", "Abbrechen", 0, 0, self
         )
+        self._scrape_progress.setWindowTitle(APP_TITLE)
         self._scrape_progress.setWindowModality(Qt.WindowModal)
         self._scrape_progress.setMinimumDuration(0)
         self._scrape_progress.setAutoClose(True)
@@ -2307,18 +1946,6 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"Gespeichert unter: {path_de} und {path_fr}", 5000
         )
-        missing_fr = result.get("missing") or []
-        if missing_fr:
-            msg = "Nicht übersetzte Begriffe (bitte in translations_fr.json ergänzen):\n\n"
-            if not result.get("argos"):
-                msg = ("Offline-Übersetzer (Argos) nicht verfügbar. "
-                       "Bitte Argos-Modell in argos_models ablegen.\n\n") + msg
-            if not result.get("fasttext"):
-                msg = ("Spracherkennung (fastText) nicht verfügbar. "
-                       "Bitte lid.176.ftz in fasttext_models ablegen.\n\n") + msg
-            msg += "\n".join(missing_fr)
-            QMessageBox.information(self, "Fehlende Übersetzungen", msg)
-
     def _parse_specs_file(self, content: str):
         """
         Returns: (left_header, right_header, rows)

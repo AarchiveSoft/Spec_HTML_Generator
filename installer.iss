@@ -3,10 +3,11 @@
 ; Output to installer_output/
 
 #define MyAppName "Claudias Listenwichtel"
-#define MyAppVersion "2.1.1"
+#define MyAppVersion "2.2.0"
 #define MyAppPublisher "GraphicArt"
 #define MyAppExeName "SpecHTMLGenerator.exe"
 #define MyAppURL "https://graphicart.ch"
+#define OpenAIKey GetEnv("OPENAI_API_KEY_BUILD")
 
 [Setup]
 ; Application identity
@@ -74,15 +75,10 @@ Source: "dist\SpecHTMLGenerator\*"; DestDir: "{app}"; Flags: ignoreversion recur
 ; Icons directory (if not bundled by PyInstaller)
 Source: "icons\*"; DestDir: "{app}\icons"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
 
-; Optional translations file for French export
-Source: "translations_fr.json"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
-Source: "translations_fr_post.json"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
-
-; Argos Translate offline models (DE→FR)
-Source: "argos_models\*"; DestDir: "{app}\argos_models"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
-
-; fastText language ID model
-Source: "fasttext_models\*"; DestDir: "{app}\fasttext_models"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
+[Registry]
+#if OpenAIKey != ""
+Root: HKCU; Subkey: "Environment"; ValueType: string; ValueName: "OPENAI_API_KEY"; ValueData: "{#OpenAIKey}"; Flags: uninsdeletevalue
+#endif
 
 [Icons]
 ; Start Menu - use user's start menu, not common
@@ -98,3 +94,4 @@ Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchAfterInstall}"; Flags
 [UninstallDelete]
 ; Clean up any leftover files
 Type: filesandordirs; Name: "{app}"
+
