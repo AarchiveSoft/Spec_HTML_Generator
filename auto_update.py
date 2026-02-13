@@ -23,7 +23,7 @@ except ImportError:
 # Configuration
 # -----------------------------------------------------------------------------
 APP_NAME = "SpecHTMLGenerator"
-CURRENT_VERSION = "2.2.0"
+CURRENT_VERSION = "2.3.1"
 UPDATE_SERVER = "https://downloads.graphicart.ch/ListenWichtel"
 VERSION_JSON_URL = f"{UPDATE_SERVER}/version.json"
 

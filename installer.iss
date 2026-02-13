@@ -3,7 +3,7 @@
 ; Output to installer_output/
 
 #define MyAppName "Claudias Listenwichtel"
-#define MyAppVersion "2.2.0"
+#define MyAppVersion "2.3.1"
 #define MyAppPublisher "GraphicArt"
 #define MyAppExeName "SpecHTMLGenerator.exe"
 #define MyAppURL "https://graphicart.ch"

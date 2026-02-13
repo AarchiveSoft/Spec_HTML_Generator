@@ -6,7 +6,7 @@
 # Claudias Listenwichtel
 
 
-[![Version](https://img.shields.io/badge/version-2.2.0-blue.svg)](https://github.com/AarchiveSoft/Spec_HTML_Generator/releases)
+[![Version](https://img.shields.io/badge/version-2.3.1-blue.svg)](https://github.com/AarchiveSoft/Spec_HTML_Generator/releases)
 [![Python](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![PySide6](https://img.shields.io/badge/PySide6-6.5+-green.svg)](https://pypi.org/project/PySide6/)
 

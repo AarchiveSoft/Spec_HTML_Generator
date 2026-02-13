@@ -5,6 +5,7 @@ import sys, os
 import threading
 import re
 import json
+import hashlib
 import html as _html
 import time
 import winreg
@@ -18,7 +19,8 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QToolBar, QVBoxLayout, QHBoxLayout,
     QLabel, QTextEdit, QLineEdit, QPushButton, QFileDialog, QMessageBox,
     QColorDialog, QCheckBox, QFrame, QSizePolicy, QScrollArea, QGridLayout,
-    QToolButton, QSpacerItem, QProgressDialog, QDialog, QDialogButtonBox, QLayout
+    QToolButton, QSpacerItem, QProgressDialog, QDialog, QDialogButtonBox, QLayout, QProgressBar,
+    QGraphicsOpacityEffect
 )
 
 # Web scraping deps (optional until used)
@@ -38,6 +40,55 @@ OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
 OPENAI_TIMEOUT_SEC = 180
 OPENAI_MAX_RETRIES = 3
 OPENAI_RETRY_BACKOFF_SEC = 2
+OPENAI_TIMEOUT_STEPS = [120, 240, 360]
+_openai_attempt_state = {"current": 0, "total": OPENAI_MAX_RETRIES, "timeout": 0, "started": None}
+
+
+def _get_cache_dir():
+    # Persistent storage in AppData for installed version, or project dir for IDE
+    app_name = "ClaudiasListenwichtel"
+    path = QStandardPaths.writableLocation(QStandardPaths.AppDataLocation)
+    if not path:
+        path = os.path.join(os.path.expanduser("~"), ".claudias_listenwichtel")
+    if "AppData" in path:
+        # On Windows AppData/Local/ClaudiasListenwichtel
+        pass
+    else:
+        # Fallback to current dir if we are in a dev env or similar
+        if not os.path.exists(path):
+            try: os.makedirs(path, exist_ok=True)
+            except: path = "."
+    
+    if not os.path.exists(path):
+        os.makedirs(path, exist_ok=True)
+    return path
+
+def _get_cache_path():
+    return os.path.join(_get_cache_dir(), "translation_cache.json")
+
+def _load_cache():
+    path = _get_cache_path()
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except:
+            return {}
+    return {}
+
+def _save_cache(data):
+    path = _get_cache_path()
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except:
+        pass
+
+def _get_cache_key(text, role, model):
+    # Normalize whitespace for more stable hashing
+    norm = " ".join((text or "").split())
+    h = hashlib.sha1(norm.encode("utf-8")).hexdigest()
+    return f"{model}:{role}:{h}"
 
 
 try:
@@ -296,14 +347,30 @@ def _strip_code_fences(text: str) -> str:
     return raw
 
 
-def _openai_translate_html(html: str) -> str:
+def _openai_translate_html(html: str, model_override: str | None = None) -> str:
     if not html:
         return html
     if not REQUESTS_AVAILABLE:
         raise RuntimeError("Requests ist nicht verfügbar. Bitte requests installieren.")
-    api_key = (os.environ.get(OPENAI_API_KEY_ENV) or "").strip()
+    api_key = ""
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
+            api_key = winreg.QueryValueEx(key, OPENAI_API_KEY_ENV)[0]
+            api_key = (api_key or "").strip()
+    except OSError:
+        api_key = ""
+    if not api_key:
+        api_key = (os.environ.get(OPENAI_API_KEY_ENV) or "").strip()
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY fehlt. Bitte API-Key setzen oder 'Nur Deutsch' aktivieren.")
+    timeout_env = (os.environ.get("SPEC_OPENAI_TIMEOUT") or "").strip()
+    timeout_steps = list(OPENAI_TIMEOUT_STEPS)
+    if timeout_env:
+        try:
+            base = max(30, int(timeout_env))
+            timeout_steps = [base, base * 2, base * 3]
+        except ValueError:
+            timeout_steps = list(OPENAI_TIMEOUT_STEPS)
     system_prompt = (
         "You are a deterministic HTML localization engine (German -> French) for camera specifications.\n"
         "Critical constraints:\n"
@@ -339,7 +406,7 @@ def _openai_translate_html(html: str) -> str:
         "HTML:\n"
     )
     payload = {
-        "model": OPENAI_MODEL,
+        "model": model_override or OPENAI_MODEL,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt + html},
@@ -350,31 +417,52 @@ def _openai_translate_html(html: str) -> str:
         "frequency_penalty": 0.0,
     }
     last_error = None
-    for attempt in range(OPENAI_MAX_RETRIES):
+    total_attempts = len(timeout_steps)
+    _openai_attempt_state["total"] = total_attempts
+    for attempt in range(total_attempts):
+        timeout_sec = timeout_steps[attempt]
+        _openai_attempt_state["current"] = attempt + 1
+        _openai_attempt_state["timeout"] = timeout_sec
+        _openai_attempt_state["started"] = time.time()
         try:
             resp = requests.post(
                 OPENAI_API_URL,
                 headers={"Authorization": f"Bearer {api_key}"},
                 json=payload,
-                timeout=OPENAI_TIMEOUT_SEC,
+                timeout=timeout_sec,
             )
             if resp.status_code != 200:
+                _openai_attempt_state["current"] = 0
+                _openai_attempt_state["timeout"] = 0
+                _openai_attempt_state["started"] = None
                 raise RuntimeError(f"OpenAI-Fehler: {resp.status_code} {resp.text}")
             data = resp.json()
             content = data["choices"][0]["message"]["content"]
+            _openai_attempt_state["current"] = 0
+            _openai_attempt_state["timeout"] = 0
+            _openai_attempt_state["started"] = None
             return _strip_code_fences(content)
         except requests.exceptions.Timeout as e:
             last_error = e
-            if attempt < OPENAI_MAX_RETRIES - 1:
+            if attempt < total_attempts - 1:
                 time.sleep(OPENAI_RETRY_BACKOFF_SEC * (2 ** attempt))
                 continue
+            _openai_attempt_state["current"] = 0
+            _openai_attempt_state["timeout"] = 0
+            _openai_attempt_state["started"] = None
             raise RuntimeError("OpenAI-Fehler: Request timeout.") from e
         except requests.exceptions.RequestException as e:
             last_error = e
-            if attempt < OPENAI_MAX_RETRIES - 1:
+            if attempt < total_attempts - 1:
                 time.sleep(OPENAI_RETRY_BACKOFF_SEC * (2 ** attempt))
                 continue
+            _openai_attempt_state["current"] = 0
+            _openai_attempt_state["timeout"] = 0
+            _openai_attempt_state["started"] = None
             raise RuntimeError(f"OpenAI-Fehler: {e}") from e
+    _openai_attempt_state["current"] = 0
+    _openai_attempt_state["timeout"] = 0
+    _openai_attempt_state["started"] = None
     raise RuntimeError(f"OpenAI-Fehler: {last_error}")
 
 
@@ -418,25 +506,83 @@ def _build_table_from_snapshot(snapshot, left_h, right_h, translate_label_fn, tr
 class ExportWorker(QThread):
     finished = Signal(dict)
 
-    def __init__(self, snapshot, left_h, right_h, path_de, path_fr, parent=None):
+    def __init__(self, snapshot, left_h, right_h, path_de, path_fr, model_override=None, parent=None):
         super().__init__(parent)
         self.snapshot = snapshot
         self.left_h = left_h
         self.right_h = right_h
         self.path_de = path_de
         self.path_fr = path_fr
+        self.model_override = model_override
 
     def run(self):
         result = {"ok": False, "error": None}
         try:
-            out = _build_table_from_snapshot(
+            # 1. Build original DE version
+            out_de = _build_table_from_snapshot(
                 self.snapshot, self.left_h, self.right_h, lambda s: s, lambda s: s
             )
-            out = _normalize_for_paste(out)
-            out_fr = _openai_translate_html(out)
-
+            out_de = _normalize_for_paste(out_de)
             with open(self.path_de, "w", encoding="utf-8") as f:
-                f.write(out)
+                f.write(out_de)
+
+            # 2. Systematic Translation (Separate content from structure) + Cache + JSON protocol
+            # Collect all translatable parts with roles
+            items: list[tuple[str, str]] = []  # (role, text)
+            if self.left_h and self.left_h.strip():
+                items.append(("header", self.left_h))
+            if self.right_h and self.right_h.strip():
+                items.append(("header", self.right_h))
+            for i, row in enumerate(self.snapshot):
+                kind, a, b = row
+                if kind in ("section", "cat"):
+                    if a and a.strip():
+                        items.append(("section", a))
+                else:
+                    if a and a.strip():
+                        items.append(("key", a))
+                    if b and b.strip():
+                        items.append(("value", b))
+
+            # Deduplicate by (role, text) while preserving order for mapping
+            seen = set()
+            uniq_items: list[tuple[str, str]] = []
+            for role, text in items:
+                k = (role, text)
+                if k not in seen:
+                    seen.add(k)
+                    uniq_items.append(k)
+
+            translate_map: dict[tuple[str, str], str] = {}
+            if uniq_items:
+                translated_list = _openai_translate_list_json_with_cache(uniq_items, self.model_override)
+                if len(translated_list) != len(uniq_items):
+                    raise RuntimeError(
+                        f"Übersetzungsfehler: Erwartet {len(uniq_items)} Elemente, erhalten {len(translated_list)}."
+                    )
+                for (role, text), tr in zip(uniq_items, translated_list):
+                    translate_map[(role, text)] = tr
+
+            # 3. Reconstruct FR Snapshot using role-aware map
+            def t_map(role: str, txt: str):
+                if not txt or not txt.strip():
+                    return txt
+                return translate_map.get((role, txt), txt)
+
+            left_h_fr = t_map("header", self.left_h)
+            right_h_fr = t_map("header", self.right_h)
+
+            snapshot_fr = []
+            for kind, a, b in self.snapshot:
+                if kind in ("section", "cat"):
+                    snapshot_fr.append((kind, t_map("section", a), b))
+                else:
+                    snapshot_fr.append((kind, t_map("key", a), t_map("value", b)))
+
+            out_fr = _build_table_from_snapshot(
+                snapshot_fr, left_h_fr, right_h_fr, lambda s: s, lambda s: s
+            )
+            out_fr = _normalize_for_paste(out_fr)
             with open(self.path_fr, "w", encoding="utf-8") as f:
                 f.write(out_fr)
 
@@ -444,6 +590,156 @@ class ExportWorker(QThread):
         except Exception as e:
             result["error"] = str(e)
         self.finished.emit(result)
+
+def _openai_translate_list_json_with_cache(items: list[tuple[str, str]], model_override: str | None = None) -> list[str]:
+    """
+    Translate a list of (role, text) using a JSON array protocol and a persistent cache.
+    Returns a list of translations in the same order as input items.
+    Roles: 'key' | 'value' | 'section' | 'header'
+    """
+    if not items:
+        return []
+    if not REQUESTS_AVAILABLE:
+        raise RuntimeError("Requests ist nicht verfügbar.")
+
+    # Resolve model and API key
+    model = model_override or OPENAI_MODEL
+    api_key = ""
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
+            api_key = winreg.QueryValueEx(key, OPENAI_API_KEY_ENV)[0]
+            api_key = (api_key or "").strip()
+    except OSError:
+        api_key = ""
+    if not api_key:
+        api_key = (os.environ.get(OPENAI_API_KEY_ENV) or "").strip()
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY fehlt.")
+
+    timeout_env = (os.environ.get("SPEC_OPENAI_TIMEOUT") or "").strip()
+    timeout_steps = list(OPENAI_TIMEOUT_STEPS)
+    if timeout_env:
+        try:
+            base = max(30, int(timeout_env))
+            timeout_steps = [base, base * 2, base * 3]
+        except ValueError:
+            timeout_steps = list(OPENAI_TIMEOUT_STEPS)
+
+    # Load cache and check hits/misses
+    cache = _load_cache() or {}
+    out = [None] * len(items)
+    misses_idx: list[int] = []
+    misses_payload: list[str] = []
+
+    for i, (role, text) in enumerate(items):
+        ck = _get_cache_key(text or "", role, model)
+        if ck in cache:
+            out[i] = cache[ck]
+        else:
+            misses_idx.append(i)
+            # Normalize whitespace like we do for hashing, but keep tags
+            misses_payload.append(" ".join((text or "").split()))
+
+    if not misses_idx:
+        return out  # type: ignore
+
+    # Prepare JSON protocol
+    system_prompt = (
+        "You are a deterministic translation engine (German -> French) for camera specifications.\n"
+        "Input: A JSON array of strings (plain text or small HTML fragments).\n"
+        "Output: A JSON array of the same length with the translations in the SAME order.\n"
+        "Constraints:\n"
+        "- Return ONLY a compact JSON array (no code fences, no keys, no comments).\n"
+        "- Preserve any HTML tags and their attributes exactly; translate only visible German text.\n"
+        "- Keep English technical terms as-is; use established French photo terminology.\n"
+        "- Temperature must be deterministic; avoid paraphrasing beyond natural FR.\n"
+    )
+
+    user_prompt = json.dumps(misses_payload, ensure_ascii=False, separators=(",", ":"))
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.0,
+    }
+
+    last_error = None
+    total_attempts = len(timeout_steps)
+    _openai_attempt_state["total"] = total_attempts
+    for attempt in range(total_attempts):
+        timeout_sec = timeout_steps[attempt]
+        _openai_attempt_state["current"] = attempt + 1
+        _openai_attempt_state["timeout"] = timeout_sec
+        _openai_attempt_state["started"] = time.time()
+        try:
+            resp = requests.post(
+                OPENAI_API_URL,
+                headers={"Authorization": f"Bearer {api_key}"},
+                json=payload,
+                timeout=timeout_sec,
+            )
+            if resp.status_code != 200:
+                _openai_attempt_state["current"] = 0
+                _openai_attempt_state["timeout"] = 0
+                _openai_attempt_state["started"] = None
+                raise RuntimeError(f"OpenAI-Fehler: {resp.status_code}")
+
+            data = resp.json()
+            content = (data["choices"][0]["message"]["content"] or "").strip()
+            content = _strip_code_fences(content)
+
+            try:
+                arr = json.loads(content)
+            except Exception as e:
+                raise RuntimeError("Unerwartetes OpenAI-Format (kein JSON-Array).") from e
+
+            if not isinstance(arr, list):
+                raise RuntimeError("OpenAI-Antwort ist kein JSON-Array.")
+            if len(arr) != len(misses_payload):
+                raise RuntimeError(
+                    f"Übersetzungsfehler: Erwartet {len(misses_payload)} Elemente, erhalten {len(arr)}."
+                )
+
+            # Fill results and update cache
+            for j, idx in enumerate(misses_idx):
+                tr = arr[j] if isinstance(arr[j], str) else str(arr[j])
+                out[idx] = tr
+                role, text = items[idx]
+                ck = _get_cache_key(text or "", role, model)
+                cache[ck] = tr
+            _save_cache(cache)
+
+            _openai_attempt_state["current"] = 0
+            _openai_attempt_state["timeout"] = 0
+            _openai_attempt_state["started"] = None
+            return out  # type: ignore
+
+        except requests.exceptions.Timeout as e:
+            last_error = e
+            if attempt < total_attempts - 1:
+                time.sleep(OPENAI_RETRY_BACKOFF_SEC * (2 ** attempt))
+                continue
+            _openai_attempt_state["current"] = 0
+            _openai_attempt_state["timeout"] = 0
+            _openai_attempt_state["started"] = None
+            raise RuntimeError("OpenAI-Fehler: Request timeout.") from e
+        except requests.exceptions.RequestException as e:
+            last_error = e
+            if attempt < total_attempts - 1:
+                time.sleep(OPENAI_RETRY_BACKOFF_SEC * (2 ** attempt))
+                continue
+            _openai_attempt_state["current"] = 0
+            _openai_attempt_state["timeout"] = 0
+            _openai_attempt_state["started"] = None
+            raise RuntimeError(f"OpenAI-Fehler: {e}") from e
+
+    _openai_attempt_state["current"] = 0
+    _openai_attempt_state["timeout"] = 0
+    _openai_attempt_state["started"] = None
+    raise RuntimeError(f"OpenAI-Fehler: {last_error}")
 
 def _sanitize_value_html(html: str) -> str:
     # remove only font-family/font-size and Qt-specific noise from inline styles
@@ -1324,14 +1620,15 @@ class MainWindow(QMainWindow):
 
     # ---------- Auto-Update Methods ----------
     def _ensure_openai_key_state(self):
-        api_key = (os.environ.get(OPENAI_API_KEY_ENV) or "").strip()
+        api_key = ""
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
+                api_key = winreg.QueryValueEx(key, OPENAI_API_KEY_ENV)[0]
+                api_key = (api_key or "").strip()
+        except OSError:
+            api_key = ""
         if not api_key:
-            try:
-                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
-                    api_key = winreg.QueryValueEx(key, OPENAI_API_KEY_ENV)[0]
-                    api_key = (api_key or "").strip()
-            except OSError:
-                api_key = ""
+            api_key = (os.environ.get(OPENAI_API_KEY_ENV) or "").strip()
         if api_key:
             os.environ[OPENAI_API_KEY_ENV] = api_key
         if api_key:
@@ -1468,6 +1765,7 @@ class MainWindow(QMainWindow):
             )
             return
 
+        self._clear_list()
         self._start_scrape(url)
 
     def _start_scrape(self, url: str):
@@ -1577,17 +1875,7 @@ class MainWindow(QMainWindow):
                 f"Spezifikationen werden geladen… {current}/{total}"
             )
 
-    def _on_clear_all(self):
-        res = QMessageBox.question(
-            self,
-            "Alles löschen",
-            "Alle Einträge und Überschriften löschen?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No
-        )
-        if res != QMessageBox.Yes:
-            return
-
+    def _clear_list(self):
         self.rows_widgets.clear()
         while self.rows_v.count():
             item = self.rows_v.takeAt(0)
@@ -1602,6 +1890,17 @@ class MainWindow(QMainWindow):
         self.btn_section.setChecked(False)
         self._set_input_mode("kv")
         self.key_in.setFocus()
+
+    def _on_clear_all(self):
+        res = QMessageBox.question(
+            self,
+            "Alles löschen",
+            "Alle Einträge und Überschriften löschen?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        if res == QMessageBox.Yes:
+            self._clear_list()
 
     def _on_section_toggled(self, checked: bool):
         self._set_input_mode("section" if checked else "kv")
@@ -1816,33 +2115,7 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
-        if self.chk_only_de.isChecked():
-            try:
-                snapshot = []
-                for rw in self.rows_widgets:
-                    if hasattr(rw, "header_plain"):
-                        snapshot.append(("section", rw.header_plain(), ""))
-                    elif hasattr(rw, "title_plain") and not hasattr(rw, "key_plain"):
-                        snapshot.append(("cat", rw.title_plain(), ""))
-                    else:
-                        snapshot.append(("kv", rw.key_plain(), rw.val_html()))
-                out = _build_table_from_snapshot(snapshot, left_h, right_h, lambda s: s, lambda s: s)
-                out = _normalize_for_paste(out)
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write(out)
-                self.statusBar().showMessage(f"Gespeichert unter: {path}", 4000)
-            except Exception as e:
-                QMessageBox.critical(self, "Speicherfehler", str(e))
-            return
-        out_dir = os.path.dirname(path) or "."
-        name = os.path.basename(path)
-        stem, ext = os.path.splitext(name)
-        if stem.endswith("_de") or stem.endswith("_fr"):
-            stem = stem[:-3]
-        if not ext:
-            ext = ".txt"
-        path_de = os.path.join(out_dir, f"{stem}_de{ext}")
-        path_fr = os.path.join(out_dir, f"{stem}_fr{ext}")
+
         snapshot = []
         for rw in self.rows_widgets:
             if hasattr(rw, "header_plain"):
@@ -1852,10 +2125,155 @@ class MainWindow(QMainWindow):
             else:
                 snapshot.append(("kv", rw.key_plain(), rw.val_html()))
 
-        self._show_translate_dialog()
-        self._export_worker = ExportWorker(snapshot, left_h, right_h, path_de, path_fr, self)
+        if self.chk_only_de.isChecked():
+            try:
+                out = _build_table_from_snapshot(snapshot, left_h, right_h, lambda s: s, lambda s: s)
+                out = _normalize_for_paste(out)
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(out)
+                self.statusBar().showMessage(f"Gespeichert unter: {path}", 4000)
+                dlg = QDialog(self)
+                dlg.setWindowTitle("Export erfolgreich")
+                dlg.setModal(True)
+                layout = QVBoxLayout(dlg)
+                layout.setContentsMargins(16, 16, 16, 16)
+                layout.setSpacing(12)
+
+                msg = QLabel("Export erfolgreich!\nDie folgende Datei wurde erstellt:")
+                msg.setAlignment(Qt.AlignLeft)
+                layout.addWidget(msg)
+
+                row = QHBoxLayout()
+                name = QLabel(os.path.basename(path))
+                name.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                btn = QPushButton("Öffnen")
+                btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(path)))
+                row.addWidget(name, 1)
+                row.addWidget(btn, 0)
+                layout.addLayout(row)
+
+                btn_row = QHBoxLayout()
+                btn_row.addStretch(1)
+                btn_ok = QPushButton("OK")
+                btn_ok.clicked.connect(dlg.accept)
+                btn_row.addWidget(btn_ok)
+                layout.addLayout(btn_row)
+
+                dlg.exec()
+            except Exception as e:
+                QMessageBox.critical(self, "Speicherfehler", str(e))
+            return
+
+        out_dir = os.path.dirname(path) or "."
+        name = os.path.basename(path)
+        stem, ext = os.path.splitext(name)
+        if stem.endswith("_de") or stem.endswith("_fr"):
+            stem = stem[:-3]
+        if not ext:
+            ext = ".txt"
+        path_de = os.path.join(out_dir, f"{stem}_de{ext}")
+        path_fr = os.path.join(out_dir, f"{stem}_fr{ext}")
+
+        self._last_export_payload = {
+            "snapshot": snapshot,
+            "left_h": left_h,
+            "right_h": right_h,
+            "path_de": path_de,
+            "path_fr": path_fr,
+        }
+
+        # Check for cache misses before showing dialog
+        needs_api = False
+        try:
+            items = []
+            if left_h and left_h.strip(): items.append(("header", left_h))
+            if right_h and right_h.strip(): items.append(("header", right_h))
+            for kind, a, b in snapshot:
+                if kind in ("section", "cat"):
+                    if a and a.strip(): items.append(("section", a))
+                else:
+                    if a and a.strip(): items.append(("key", a))
+                    if b and b.strip(): items.append(("value", b))
+
+            cache = _load_cache() or {}
+            model = OPENAI_MODEL
+            for role, text in items:
+                ck = _get_cache_key(text or "", role, model)
+                if ck not in cache:
+                    needs_api = True
+                    break
+        except Exception:
+            needs_api = True # Fallback to showing dialog if cache check fails
+
+        _openai_attempt_state["current"] = 0
+        _openai_attempt_state["timeout"] = 0
+        _openai_attempt_state["started"] = None
+        
+        if needs_api:
+            self._show_translate_dialog()
+            
+        self._translate_started = time.time()
+        self._export_worker = ExportWorker(snapshot, left_h, right_h, path_de, path_fr, None, self)
         self._export_worker.finished.connect(
             lambda result: self._on_export_finished(result, path_de, path_fr)
+        )
+        self._export_worker.start()
+
+    def _retry_last_export(self, model_override: str | None = None):
+        payload = getattr(self, "_last_export_payload", None)
+        if not payload:
+            QMessageBox.information(self, "Erneut versuchen", "Kein vorheriger Export gefunden.")
+            return
+        if getattr(self, "_export_worker", None):
+            try:
+                self._export_worker.wait(50)
+            except Exception:
+                pass
+
+        # Check for cache misses before showing dialog
+        needs_api = False
+        try:
+            items = []
+            left_h = payload["left_h"]
+            right_h = payload["right_h"]
+            if left_h and left_h.strip(): items.append(("header", left_h))
+            if right_h and right_h.strip(): items.append(("header", right_h))
+            for kind, a, b in payload["snapshot"]:
+                if kind in ("section", "cat"):
+                    if a and a.strip(): items.append(("section", a))
+                else:
+                    if a and a.strip(): items.append(("key", a))
+                    if b and b.strip(): items.append(("value", b))
+
+            cache = _load_cache() or {}
+            model = model_override or OPENAI_MODEL
+            for role, text in items:
+                ck = _get_cache_key(text or "", role, model)
+                if ck not in cache:
+                    needs_api = True
+                    break
+        except Exception:
+            needs_api = True
+
+        _openai_attempt_state["current"] = 0
+        _openai_attempt_state["timeout"] = 0
+        _openai_attempt_state["started"] = None
+        
+        if needs_api:
+            self._show_translate_dialog()
+            
+        self._translate_started = time.time()
+        self._export_worker = ExportWorker(
+            payload["snapshot"],
+            payload["left_h"],
+            payload["right_h"],
+            payload["path_de"],
+            payload["path_fr"],
+            model_override,
+            self
+        )
+        self._export_worker.finished.connect(
+            lambda result: self._on_export_finished(result, payload["path_de"], payload["path_fr"])
         )
         self._export_worker.start()
 
@@ -1901,22 +2319,76 @@ class MainWindow(QMainWindow):
         text_label.setStyleSheet("color:#ffffff; font-weight:bold; font-size:18px; margin-top:-6px;")
         host_layout.addWidget(text_label, 0, Qt.AlignHCenter)
 
+        progress = QProgressBar()
+        progress.setRange(0, 100)
+        progress.setValue(0)
+        # Keep the built-in text hidden; we'll render a floating label at the tip
+        progress.setTextVisible(False)
+        progress.setFixedWidth(host.sizeHint().width() - 8)
+        progress.setStyleSheet(
+            "QProgressBar{color:#ffffff;border:0;background:rgba(255,255,255,0.2);"
+            "border-radius:6px;height:10px;}"
+            "QProgressBar::chunk{background:#ffffff;border-radius:6px;}"
+        )
+        host_layout.addWidget(progress, 0, Qt.AlignHCenter)
+
+        # Percentage label that follows the tip of the bar
+        pct_label = QLabel("0%", progress)
+        pct_label.setStyleSheet("color:#006b8d; font-weight:700; font-size:12px; background: transparent;")
+        pct_label.setAttribute(Qt.WA_TransparentForMouseEvents)
+        pct_label.setAttribute(Qt.WA_TranslucentBackground, True)
+        pct_label.adjustSize()
+        # Initial placement (at start of the bar)
+        def _place_pct_label(pct_val: int):
+            # Ensure label size up-to-date
+            pct_label.setText(f"{pct_val}%")
+            pct_label.adjustSize()
+            w = progress.width()
+            h = progress.height()
+            # Position label fully inside the bar, slightly left of the tip
+            tip = int(w * max(0, min(pct_val, 100)) / 100)
+            x = tip - pct_label.width() - 4
+            x = max(2, min(x, w - pct_label.width() - 4))
+            y = (h - pct_label.height()) // 2
+            pct_label.move(x, y)
+        _place_pct_label(0)
+
+        attempts_label = QLabel()
+        attempts_label.setAlignment(Qt.AlignHCenter)
+        attempts_label.setStyleSheet("color:#ffffff; font-size:12px; margin-top:2px;")
+        host_layout.addWidget(attempts_label, 0, Qt.AlignHCenter)
+
         target = "Übersetzen"
-        gib = ["xqv!9kz", "k9v!xqz", "qz!9vkx", "9xq!kvz", "zq!9xkv"]
-        frames = []
-        base = gib[0].ljust(len(target))
-        for i in range(len(target) + 1):
-            head = target[:i]
-            tail = base[i:]
-            frames.append(head + tail)
-        frames += [target]
+        long_target = "Das dauert gerade etwas länger als erwartet"
+        gib_patterns = ["xqv!9kz", "k9v!xqz", "qz!9vkx", "9xq!kvz", "zq!9xkv"]
+        def _expand_pattern(pat: str, length: int) -> str:
+            if not pat:
+                return "x" * length
+            if len(pat) >= length:
+                return pat[:length]
+            return (pat * ((length // len(pat)) + 1))[:length]
+        def _build_gib(target_text: str):
+            return [_expand_pattern(p, len(target_text)) for p in gib_patterns]
+        def _build_frames(target_text: str, gib_list: list[str]):
+            base = gib_list[0]
+            built = []
+            for i in range(len(target_text) + 1):
+                head = target_text[:i]
+                tail = base[i:]
+                built.append(head + tail)
+            built += [target_text]
+            return built
+        gib = _build_gib(target)
+        frames_ref = {"gib": gib, "frames": _build_frames(target, gib)}
         idx = {"i": 0, "phase": 0}
+        long_state = {"started": None, "switched": False}
 
         def tick():
             if idx["phase"] < len(gib):
                 text_label.setText(gib[idx["phase"]])
                 idx["phase"] += 1
                 return
+            frames = frames_ref["frames"]
             text_label.setText(frames[idx["i"] % len(frames)])
             idx["i"] += 1
 
@@ -1924,6 +2396,54 @@ class MainWindow(QMainWindow):
         timer.timeout.connect(tick)
         timer.start(120)
         tick()
+
+        progress_timer = QTimer(dlg)
+        started = getattr(self, "_translate_started", None) or time.time()
+        expected = max(20.0, float(getattr(self, "_last_translate_seconds", 90.0)))
+        progress_state = {"attempt": 0, "attempt_started": started}
+        def tick_progress():
+            cur = _openai_attempt_state.get("current", 0)
+            total = _openai_attempt_state.get("total", len(OPENAI_TIMEOUT_STEPS))
+            timeout_sec = _openai_attempt_state.get("timeout", 0)
+            attempt_started = _openai_attempt_state.get("started") or started
+            if cur != progress_state["attempt"] and cur > 0:
+                progress_state["attempt"] = cur
+                progress_state["attempt_started"] = attempt_started
+                progress.setValue(0)
+                _place_pct_label(0)
+                long_state["started"] = None
+                long_state["switched"] = False
+                gib = _build_gib(target)
+                frames_ref["gib"] = gib
+                frames_ref["frames"] = _build_frames(target, gib)
+                idx["i"] = 0
+                idx["phase"] = 0
+            elapsed = max(0.0, time.time() - progress_state["attempt_started"])
+            expected_local = max(10.0, float(timeout_sec or expected))
+            pct = min(95, int((elapsed / expected_local) * 95))
+            progress.setValue(pct)
+            _place_pct_label(pct)
+            if cur > 0:
+                attempts_label.setText(
+                    f"Versuch {cur} von {total}\n"
+                    f"Timeout: {timeout_sec}s\n"
+                    f"Laufzeit: {int(elapsed)}s"
+                )
+            else:
+                attempts_label.setText("")
+            if pct >= 95 and long_state["started"] is None:
+                long_state["started"] = time.time()
+            if long_state["started"] and not long_state["switched"]:
+                if time.time() - long_state["started"] >= 2.0:
+                    gib = _build_gib(long_target)
+                    frames_ref["gib"] = gib
+                    frames_ref["frames"] = _build_frames(long_target, gib)
+                    idx["i"] = 0
+                    idx["phase"] = 0
+                    long_state["switched"] = True
+        progress_timer.timeout.connect(tick_progress)
+        progress_timer.start(200)
+        tick_progress()
 
         self._translate_dialog = dlg
         host.setFixedSize(host.sizeHint())
@@ -1937,15 +2457,140 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(100, dlg.show)
 
     def _on_export_finished(self, result, path_de, path_fr):
+        started = getattr(self, "_translate_started", None)
+        if started:
+            self._last_translate_seconds = max(5.0, time.time() - started)
         if getattr(self, "_translate_dialog", None):
             self._translate_dialog.close()
             self._translate_dialog = None
         if not result.get("ok"):
-            QMessageBox.critical(self, "Speicherfehler", result.get("error") or "Unbekannter Fehler")
+            err = result.get("error") or "Unbekannter Fehler"
+            if "timeout" in err.lower() or "timed out" in err.lower():
+                msg = (
+                    "Die Übersetzung hat zu lange gedauert und wurde abgebrochen.\n\n"
+                    "<b>Tipp:</b> Exportiere einmal mit „Nur Deutsch“ – das geht sofort und speichert "
+                    "den aktuellen Stand (die TXT kann später wieder geöffnet werden).\n\n"
+                    "Möchtest du es jetzt erneut versuchen?"
+                )
+                box = QMessageBox(self)
+                box.setWindowTitle("Übersetzung fehlgeschlagen")
+                box.setIcon(QMessageBox.Warning)
+                box.setTextFormat(Qt.RichText)
+                box.setText(msg)
+                fallback_cb = QCheckBox("Mit einfacherer KI erneut versuchen (Risiko von Übersetzungsfehlern)")
+                box.setCheckBox(fallback_cb)
+                retry_btn = box.addButton("Erneut versuchen", QMessageBox.AcceptRole)
+                save_retry_btn = box.addButton("Speichern und erneut versuchen", QMessageBox.ActionRole)
+                box.addButton("Abbrechen", QMessageBox.RejectRole)
+                box.exec()
+                clicked = box.clickedButton()
+                model_override = "gpt-4.1-nano" if fallback_cb.isChecked() else None
+                if clicked == save_retry_btn:
+                    self.chk_only_de.setChecked(True)
+                    self.export_table_only()
+                    self.chk_only_de.setChecked(False)
+                    self._retry_last_export(model_override)
+                elif clicked == retry_btn:
+                    self._retry_last_export(model_override)
+                return
+            QMessageBox.critical(self, "Speicherfehler", err)
             return
         self.statusBar().showMessage(
             f"Gespeichert unter: {path_de} und {path_fr}", 5000
         )
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Export erfolgreich")
+        dlg.setModal(True)
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        msg = QLabel("Export erfolgreich!\nDie folgenden Dateien wurden erstellt:")
+        msg.setAlignment(Qt.AlignLeft)
+        layout.addWidget(msg)
+
+        def _copy_to_clipboard(path: str):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                QApplication.clipboard().setText(content)
+                self._show_copy_notification()
+            except Exception as e:
+                QMessageBox.warning(self, "Kopieren fehlgeschlagen", f"Fehler beim Lesen der Datei: {e}")
+
+        def _file_row(path: str):
+            row = QHBoxLayout()
+            name = QLabel(os.path.basename(path))
+            name.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            
+            btn_open = QPushButton("Öffnen")
+            btn_open.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(path)))
+            
+            btn_copy = QPushButton("Ergebnis kopieren")
+            btn_copy.clicked.connect(lambda: _copy_to_clipboard(path))
+            
+            row.addWidget(name, 1)
+            row.addWidget(btn_copy, 0)
+            row.addWidget(btn_open, 0)
+            return row
+
+        layout.addLayout(_file_row(path_de))
+        layout.addLayout(_file_row(path_fr))
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        btn_both = QPushButton("Beide öffnen")
+        btn_both.clicked.connect(lambda: (
+            QDesktopServices.openUrl(QUrl.fromLocalFile(path_de)),
+            QDesktopServices.openUrl(QUrl.fromLocalFile(path_fr))
+        ))
+        btn_ok = QPushButton("OK")
+        btn_ok.clicked.connect(dlg.accept)
+        btn_row.addWidget(btn_both)
+        btn_row.addWidget(btn_ok)
+        layout.addLayout(btn_row)
+
+        dlg.exec()
+
+    def _show_copy_notification(self):
+        if hasattr(self, "_copy_notif") and self._copy_notif:
+            self._copy_notif.close()
+            self._copy_notif.deleteLater()
+
+        notif = QLabel("Kopiert", self)
+        notif.setAlignment(Qt.AlignCenter)
+        notif.setStyleSheet(f"""
+            background-color: {ACCENT};
+            color: white;
+            padding: 8px 16px;
+            border-radius: 4px;
+            font-weight: bold;
+        """)
+        notif.setAttribute(Qt.WA_TransparentForMouseEvents)
+        notif.adjustSize()
+
+        # Center in the window
+        notif.move(
+            (self.width() - notif.width()) // 2,
+            self.height() - notif.height() - 60
+        )
+        notif.show()
+        self._copy_notif = notif
+
+        # Fade out effect
+        from PySide6.QtCore import QPropertyAnimation, QEasingCurve
+
+        eff = QGraphicsOpacityEffect(notif)
+        notif.setGraphicsEffect(eff)
+        
+        anim = QPropertyAnimation(eff, b"opacity")
+        anim.setDuration(1500)
+        anim.setStartValue(1.0)
+        anim.setEndValue(0.0)
+        anim.setEasingCurve(QEasingCurve.InQuad)
+        anim.finished.connect(notif.deleteLater)
+        anim.start()
+
     def _parse_specs_file(self, content: str):
         """
         Returns: (left_header, right_header, rows)
@@ -2034,8 +2679,9 @@ class MainWindow(QMainWindow):
         File → headers + rows → repopulate UI.
         Preserves rich HTML in value cells; keys are plain text (bold in UI).
         """
+        desktop = QStandardPaths.writableLocation(QStandardPaths.DesktopLocation) or ""
         path, _ = QFileDialog.getOpenFileName(
-            self, "Öffnen", "", "Text/HTML (*.txt *.html *.htm);;Alle Dateien (*.*)"
+            self, "Öffnen", desktop, "Text/HTML (*.txt *.html *.htm);;Alle Dateien (*.*)"
         )
         if not path:
             return
